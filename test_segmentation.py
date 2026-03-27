@@ -1,48 +1,29 @@
 """
-Segmentation Validation Script
-Converted from val_mask.ipynb
-Evaluates a trained segmentation head on validation data and saves predictions
+Offroad Semantic Segmentation — Test/Evaluation Script
+DeepLabV3-ResNet50 with Test-Time Augmentation
 """
 
 import torch
-from torch.utils.data import Dataset, DataLoader
-import numpy as np
-from torch import nn
+import torch.nn as nn
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
-import torchvision.transforms as transforms
+from torch.utils.data import Dataset, DataLoader
+import torchvision.models.segmentation as seg_models
+import numpy as np
 from PIL import Image
 import cv2
 import os
-import argparse
 from tqdm import tqdm
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
-# Set matplotlib to non-interactive backend
-plt.switch_backend('Agg')
-
 
 # ============================================================================
-# Utility Functions
+# Class Definitions
 # ============================================================================
 
-def save_image(img, filename):
-    """Save an image tensor to file after denormalizing."""
-    img = np.array(img)
-    mean = np.array([0.485, 0.456, 0.406])
-    std = np.array([0.229, 0.224, 0.225])
-    img = np.moveaxis(img, 0, -1)
-    img = (img * std + mean) * 255
-    img = np.clip(img, 0, 255).astype(np.uint8)
-    cv2.imwrite(filename, img[:, :, ::-1])
-
-
-# ============================================================================
-# Mask Conversion
-# ============================================================================
-
-# Mapping from raw pixel values to new class IDs
 value_map = {
     0: 0,        # Background
     100: 1,      # Trees
@@ -54,480 +35,354 @@ value_map = {
     700: 7,      # Logs
     800: 8,      # Rocks
     7100: 9,     # Landscape
-    10000: 10    # Sky
+    10000: 10,   # Sky
 }
 
-# Class names for visualization
+n_classes = 11
+
 class_names = [
-    'Background', 'Trees', 'Lush Bushes', 'Dry Grass', 'Dry Bushes',
-    'Ground Clutter', 'Flowers', 'Logs', 'Rocks', 'Landscape', 'Sky'
+    "Background", "Trees", "Lush Bushes", "Dry Grass", "Dry Bushes",
+    "Ground Clutter", "Flowers", "Logs", "Rocks", "Landscape", "Sky"
 ]
 
-n_classes = len(value_map)
-
-# Color palette for visualization (11 distinct colors)
 color_palette = np.array([
-    [0, 0, 0],        # Background - black
-    [34, 139, 34],    # Trees - forest green
-    [0, 255, 0],      # Lush Bushes - lime
-    [210, 180, 140],  # Dry Grass - tan
-    [139, 90, 43],    # Dry Bushes - brown
-    [128, 128, 0],    # Ground Clutter - olive
-    [255, 105, 180],  # Flowers - hot pink
-    [139, 69, 19],    # Logs - saddle brown
-    [128, 128, 128],  # Rocks - gray
-    [160, 82, 45],    # Landscape - sienna
-    [135, 206, 235],  # Sky - sky blue
+    [0, 0, 0],         # Background — black
+    [34, 139, 34],     # Trees — forest green
+    [0, 255, 0],       # Lush Bushes — lime
+    [210, 180, 140],   # Dry Grass — tan
+    [139, 90, 43],     # Dry Bushes — brown
+    [128, 128, 0],     # Ground Clutter — olive
+    [255, 105, 180],   # Flowers — hot pink
+    [139, 69, 19],     # Logs — saddle brown
+    [128, 128, 128],   # Rocks — gray
+    [160, 82, 45],     # Landscape — sienna
+    [135, 206, 235],   # Sky — sky blue
 ], dtype=np.uint8)
 
 
-def convert_mask(mask):
-    """Convert raw mask values to class IDs."""
-    arr = np.array(mask)
-    new_arr = np.zeros_like(arr, dtype=np.uint8)
-    for raw_value, new_value in value_map.items():
-        new_arr[arr == raw_value] = new_value
-    return Image.fromarray(new_arr)
-
-
-def mask_to_color(mask):
-    """Convert a class mask to a colored RGB image."""
-    h, w = mask.shape
-    color_mask = np.zeros((h, w, 3), dtype=np.uint8)
-    for class_id in range(n_classes):
-        color_mask[mask == class_id] = color_palette[class_id]
-    return color_mask
-
-
 # ============================================================================
-# Dataset
+# Dataset — returns image (transformed) + mask at NATIVE resolution
 # ============================================================================
 
-class MaskDataset(Dataset):
+class TestDataset(Dataset):
     def __init__(self, data_dir, transform=None):
-        self.image_dir = os.path.join(data_dir, 'Color_Images')
-        self.masks_dir = os.path.join(data_dir, 'Segmentation')
+        self.img_dir = os.path.join(data_dir, 'Color_Images')
+        self.mask_dir = os.path.join(data_dir, 'Segmentation')
+        self.has_masks = os.path.isdir(self.mask_dir) and len(os.listdir(self.mask_dir)) > 0
+        self.img_names = sorted(os.listdir(self.img_dir))
         self.transform = transform
-        self.data_ids = os.listdir(self.image_dir)
 
     def __len__(self):
-        return len(self.data_ids)
+        return len(self.img_names)
 
     def __getitem__(self, idx):
-        data_id = self.data_ids[idx]
-        img_path = os.path.join(self.image_dir, data_id)
-        mask_path = os.path.join(self.masks_dir, data_id)
+        img_name = self.img_names[idx]
+        img_path = os.path.join(self.img_dir, img_name)
 
         image = np.array(Image.open(img_path).convert("RGB"))
-        mask = np.array(Image.open(mask_path))
+        orig_h, orig_w = image.shape[:2]
 
-        # Convert raw mask values to class IDs
-        new_mask = np.zeros_like(mask, dtype=np.uint8)
-        for raw_value, new_value in value_map.items():
-            new_mask[mask == raw_value] = new_value
+        # GT mask at native resolution (NOT transformed)
+        mask = None
+        if self.has_masks:
+            mask_path = os.path.join(self.mask_dir, img_name)
+            if os.path.exists(mask_path):
+                raw_mask = np.array(Image.open(mask_path))
+                mask = np.zeros(raw_mask.shape[:2], dtype=np.int64)
+                for raw_value, class_id in value_map.items():
+                    mask[raw_mask == raw_value] = class_id
+                mask = torch.from_numpy(mask)
 
+        # Transform image only (resize + normalize for model input)
         if self.transform:
-            transformed = self.transform(image=image, mask=new_mask)
+            transformed = self.transform(image=image)
             image = transformed['image']
-            new_mask = transformed['mask'].long()
 
-        return image, new_mask.unsqueeze(0) if new_mask.dim() == 2 else new_mask, data_id
+        data_id = os.path.splitext(img_name)[0]
 
+        if mask is None:
+            mask = torch.tensor(-1)
 
-# ============================================================================
-# Model: Segmentation Head (ConvNeXt-style) - Must match training
-# ============================================================================
-
-class ConvNeXtBlock(nn.Module):
-    """ConvNeXt-style block with residual connection and LayerNorm."""
-    def __init__(self, dim):
-        super().__init__()
-        self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
-        self.norm = nn.GroupNorm(1, dim)
-        self.pwconv1 = nn.Conv2d(dim, dim * 4, kernel_size=1)
-        self.act = nn.GELU()
-        self.pwconv2 = nn.Conv2d(dim * 4, dim, kernel_size=1)
-
-    def forward(self, x):
-        residual = x
-        x = self.dwconv(x)
-        x = self.norm(x)
-        x = self.pwconv1(x)
-        x = self.act(x)
-        x = self.pwconv2(x)
-        return x + residual
-
-
-class SegmentationHeadConvNeXt(nn.Module):
-    def __init__(self, in_channels, out_channels, tokenW, tokenH):
-        super().__init__()
-        self.H, self.W = tokenH, tokenW
-        hidden_dim = 256
-
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, hidden_dim, kernel_size=7, padding=3),
-            nn.GroupNorm(1, hidden_dim),
-            nn.GELU()
-        )
-
-        self.block1 = ConvNeXtBlock(hidden_dim)
-        self.block2 = ConvNeXtBlock(hidden_dim)
-
-        self.dropout = nn.Dropout2d(0.1)
-        self.classifier = nn.Conv2d(hidden_dim, out_channels, 1)
-
-    def forward(self, x):
-        B, N, C = x.shape
-        x = x.reshape(B, self.H, self.W, C).permute(0, 3, 1, 2)
-        x = self.stem(x)
-        x = self.block1(x)
-        x = self.block2(x)
-        x = self.dropout(x)
-        return self.classifier(x)
+        return image, mask, data_id, orig_h, orig_w
 
 
 # ============================================================================
-# Metrics
+# Model
 # ============================================================================
 
-def compute_iou(pred, target, num_classes=10, ignore_index=255):
-    """Compute IoU for each class and return mean IoU."""
-    pred = torch.argmax(pred, dim=1)
-    pred, target = pred.view(-1), target.view(-1)
-
-    iou_per_class = []
-    for class_id in range(num_classes):
-        if class_id == ignore_index:
-            continue
-
-        pred_inds = pred == class_id
-        target_inds = target == class_id
-
-        intersection = (pred_inds & target_inds).sum().float()
-        union = (pred_inds | target_inds).sum().float()
-
-        if union == 0:
-            iou_per_class.append(float('nan'))
-        else:
-            iou_per_class.append((intersection / union).cpu().numpy())
-
-    return np.nanmean(iou_per_class), iou_per_class
-
-
-def compute_dice(pred, target, num_classes=10, smooth=1e-6):
-    """Compute Dice coefficient (F1 Score) per class and return mean Dice Score."""
-    pred = torch.argmax(pred, dim=1)
-    pred, target = pred.view(-1), target.view(-1)
-
-    dice_per_class = []
-    for class_id in range(num_classes):
-        pred_inds = pred == class_id
-        target_inds = target == class_id
-
-        intersection = (pred_inds & target_inds).sum().float()
-        dice_score = (2. * intersection + smooth) / (pred_inds.sum().float() + target_inds.sum().float() + smooth)
-
-        dice_per_class.append(dice_score.cpu().numpy())
-
-    return np.mean(dice_per_class), dice_per_class
-
-
-def compute_pixel_accuracy(pred, target):
-    """Compute pixel accuracy."""
-    pred_classes = torch.argmax(pred, dim=1)
-    return (pred_classes == target).float().mean().cpu().numpy()
+def create_model(num_classes=11):
+    model = seg_models.deeplabv3_resnet50(weights=None)
+    model.classifier[4] = nn.Conv2d(256, num_classes, kernel_size=1)
+    model.aux_classifier[4] = nn.Conv2d(256, num_classes, kernel_size=1)
+    return model
 
 
 # ============================================================================
-# Visualization Functions
+# TTA Inference — predictions at native resolution
 # ============================================================================
 
-def save_prediction_comparison(img_tensor, gt_mask, pred_mask, output_path, data_id):
-    """Save a side-by-side comparison of input, ground truth, and prediction."""
-    # Denormalize image
+def predict_with_tta(model, images, orig_h, orig_w):
+    """Inference with horizontal flip TTA, output upsampled to native resolution."""
+    with torch.no_grad(), torch.amp.autocast('cuda'):
+        # Original
+        out = model(images)['out']
+        out = F.interpolate(out, size=(orig_h, orig_w), mode='bilinear', align_corners=False)
+        probs = torch.softmax(out, dim=1)
+
+        # Horizontal flip
+        images_flip = torch.flip(images, dims=[3])
+        out_flip = model(images_flip)['out']
+        out_flip = torch.flip(out_flip, dims=[3])
+        out_flip = F.interpolate(out_flip, size=(orig_h, orig_w),
+                                 mode='bilinear', align_corners=False)
+        probs = probs + torch.softmax(out_flip, dim=1)
+
+    return probs / 2.0
+
+
+# ============================================================================
+# Visualization
+# ============================================================================
+
+def mask_to_color(mask):
+    """Convert class-ID mask to RGB."""
+    h, w = mask.shape
+    color = np.zeros((h, w, 3), dtype=np.uint8)
+    for c in range(n_classes):
+        color[mask == c] = color_palette[c]
+    return color
+
+
+def denormalize_image(img_tensor):
+    """Convert normalized image tensor back to uint8 RGB numpy array."""
     img = img_tensor.cpu().numpy()
     mean = np.array([0.485, 0.456, 0.406])
     std = np.array([0.229, 0.224, 0.225])
     img = np.moveaxis(img, 0, -1)
-    img = img * std + mean
-    img = np.clip(img, 0, 1)
+    img = (img * std + mean) * 255
+    return np.clip(img, 0, 255).astype(np.uint8)
 
-    # Convert masks to color
-    gt_color = mask_to_color(gt_mask.cpu().numpy().astype(np.uint8))
-    pred_color = mask_to_color(pred_mask.cpu().numpy().astype(np.uint8))
 
-    # Create figure
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+def save_comparison(image_np, gt_mask, pred_mask, save_path):
+    """Save side-by-side: image | GT | prediction."""
+    gt_color = mask_to_color(gt_mask)
+    pred_color = mask_to_color(pred_mask)
 
-    axes[0].imshow(img)
-    axes[0].set_title('Input Image')
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    axes[0].imshow(image_np)
+    axes[0].set_title("Input Image")
     axes[0].axis('off')
-
     axes[1].imshow(gt_color)
-    axes[1].set_title('Ground Truth')
+    axes[1].set_title("Ground Truth")
     axes[1].axis('off')
-
     axes[2].imshow(pred_color)
-    axes[2].set_title('Prediction')
+    axes[2].set_title("Prediction")
     axes[2].axis('off')
-
-    plt.suptitle(f'Sample: {data_id}')
     plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
-
-
-def save_metrics_summary(results, output_dir):
-    """Save metrics summary to a text file and create bar chart."""
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Save text summary
-    filepath = os.path.join(output_dir, 'evaluation_metrics.txt')
-    with open(filepath, 'w') as f:
-        f.write("EVALUATION RESULTS\n")
-        f.write("=" * 50 + "\n")
-        f.write(f"Mean IoU:          {results['mean_iou']:.4f}\n")
-        f.write("=" * 50 + "\n\n")
-
-        f.write("Per-Class IoU:\n")
-        f.write("-" * 40 + "\n")
-        for i, (name, iou) in enumerate(zip(class_names, results['class_iou'])):
-            iou_str = f"{iou:.4f}" if not np.isnan(iou) else "N/A"
-            f.write(f"  {name:<20}: {iou_str}\n")
-
-    print(f"\nSaved evaluation metrics to {filepath}")
-
-    # Create bar chart for per-class IoU
-    fig, ax = plt.subplots(figsize=(10, 6))
-
-    valid_iou = [iou if not np.isnan(iou) else 0 for iou in results['class_iou']]
-    ax.bar(range(n_classes), valid_iou, color=[color_palette[i] / 255 for i in range(n_classes)],
-           edgecolor='black')
-    ax.set_xticks(range(n_classes))
-    ax.set_xticklabels(class_names, rotation=45, ha='right')
-    ax.set_ylabel('IoU')
-    ax.set_title(f'Per-Class IoU (Mean: {results["mean_iou"]:.4f})')
-    ax.set_ylim(0, 1)
-    ax.axhline(y=results['mean_iou'], color='red', linestyle='--', label='Mean')
-    ax.legend()
-    ax.grid(axis='y', alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'per_class_metrics.png'), dpi=150, bbox_inches='tight')
-    plt.close()
-
-    print(f"Saved per-class metrics chart to '{output_dir}/per_class_metrics.png'")
 
 
 # ============================================================================
-# Main Validation Function
+# Main
 # ============================================================================
 
 def main():
-    # Get script directory for default paths
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    
-    parser = argparse.ArgumentParser(description='Segmentation prediction/inference script')
-    parser.add_argument('--model_path', type=str, default=os.path.join(script_dir, 'segmentation_head.pth'),
-                        help='Path to trained model weights')
-    parser.add_argument('--data_dir', type=str, default=os.path.join(script_dir, 'Offroad_Segmentation_testImages'),
-                        help='Path to validation dataset')
-    parser.add_argument('--output_dir', type=str, default='./predictions',
-                        help='Directory to save prediction visualizations')
-    parser.add_argument('--batch_size', type=int, default=2,
-                        help='Batch size for validation')
-    parser.add_argument('--num_samples', type=int, default=5,
-                        help='Number of comparison visualizations to save (predictions saved for ALL images)')
-    args = parser.parse_args()
-
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    # Configuration
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    # Image dimensions (must match training)
-    scale = 0.7
-    w = int(((960 * scale) // 14) * 14)   # 672
-    h = int(((540 * scale) // 14) * 14)   # 378
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    test_dir = os.path.join(script_dir, 'Offroad_Segmentation_testImages')
+    print(f"Loading dataset from {test_dir}...")
 
-    # Transforms (albumentations, must match training val transform)
-    val_transform = A.Compose([
-        A.Resize(h, w),
+    # Model inference resolution (must match Phase 2 training resolution)
+    H, W = 512, 896
+
+    test_transform = A.Compose([
+        A.Resize(H, W),
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2(),
     ])
 
-    # Create dataset
-    print(f"Loading dataset from {args.data_dir}...")
-    valset = MaskDataset(data_dir=args.data_dir, transform=val_transform)
-    val_loader = DataLoader(valset, batch_size=args.batch_size, shuffle=False)
-    print(f"Loaded {len(valset)} samples")
+    dataset = TestDataset(test_dir, transform=test_transform)
+    print(f"Loaded {len(dataset)} samples (GT masks: {dataset.has_masks})")
 
-    # Load DINOv2 backbone
-    print("Loading DINOv2 backbone...")
-    BACKBONE_SIZE = "small"
-    backbone_archs = {
-        "small": "vits14",
-        "base": "vitb14_reg",
-        "large": "vitl14_reg",
-        "giant": "vitg14_reg",
-    }
-    backbone_arch = backbone_archs[BACKBONE_SIZE]
-    backbone_name = f"dinov2_{backbone_arch}"
+    loader = DataLoader(dataset, batch_size=2, shuffle=False,
+                        num_workers=0, pin_memory=True)
 
-    backbone_model = torch.hub.load(repo_or_dir="facebookresearch/dinov2", model=backbone_name)
-    backbone_model.to(device)
-    print("Backbone loaded successfully!")
+    # Load model
+    model = create_model(n_classes).to(device)
 
-    # Get embedding dimension
-    sample_img, _, _ = valset[0]
-    sample_img = sample_img.unsqueeze(0).to(device)
-    with torch.no_grad():
-        output = backbone_model.forward_features(sample_img)["x_norm_patchtokens"]
-    n_embedding = output.shape[2]
-    print(f"Embedding dimension: {n_embedding}")
+    model_path = os.path.join(script_dir, 'segmentation_model.pth')
+    if not os.path.exists(model_path):
+        model_path = os.path.join(script_dir, 'segmentation_model_best.pth')
+    if not os.path.exists(model_path):
+        model_path = os.path.join(script_dir, 'best_model_phase1.pth')
 
-    # Load checkpoint (supports both old and new format)
-    print(f"Loading model from {args.model_path}...")
-    checkpoint = torch.load(args.model_path, map_location=device)
-
-    classifier = SegmentationHeadConvNeXt(
-        in_channels=n_embedding,
-        out_channels=n_classes,
-        tokenW=w // 14,
-        tokenH=h // 14
-    )
-
-    if isinstance(checkpoint, dict) and 'classifier' in checkpoint:
-        # New format: full checkpoint with backbone + classifier
-        classifier.load_state_dict(checkpoint['classifier'])
-        backbone_model.load_state_dict(checkpoint['backbone'])
-        print("Loaded full checkpoint (backbone + classifier)")
-    else:
-        # Legacy format: classifier-only state_dict
-        classifier.load_state_dict(checkpoint)
-        print("Loaded legacy classifier-only checkpoint")
-
-    classifier = classifier.to(device)
-    classifier.eval()
-    backbone_model.eval()
+    print(f"Loading model from {model_path}...")
+    checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+    model.load_state_dict(checkpoint)
+    model.eval()
     print("Model loaded successfully!")
 
-    # Create subdirectories for outputs
-    masks_dir = os.path.join(args.output_dir, 'masks')
-    masks_color_dir = os.path.join(args.output_dir, 'masks_color')
-    comparisons_dir = os.path.join(args.output_dir, 'comparisons')
+    # Output directories
+    pred_dir = os.path.join(script_dir, 'predictions')
+    masks_dir = os.path.join(pred_dir, 'masks')
+    color_dir = os.path.join(pred_dir, 'masks_color')
+    comp_dir = os.path.join(pred_dir, 'comparisons')
     os.makedirs(masks_dir, exist_ok=True)
-    os.makedirs(masks_color_dir, exist_ok=True)
-    os.makedirs(comparisons_dir, exist_ok=True)
+    os.makedirs(color_dir, exist_ok=True)
+    os.makedirs(comp_dir, exist_ok=True)
 
-    # Run evaluation and save predictions for ALL images
-    print(f"\nRunning evaluation and saving predictions for all {len(valset)} images...")
+    # Global metric accumulators
+    total_inter = torch.zeros(n_classes)
+    total_union = torch.zeros(n_classes)
+    total_correct = 0
+    total_pixels = 0
+    has_gt = False
+    comparison_count = 0
+    max_comparisons = 10
 
-    iou_scores = []
-    dice_scores = []
-    pixel_accuracies = []
-    all_class_iou = []
-    all_class_dice = []
-    sample_count = 0
+    print(f"\nRunning evaluation with TTA on {len(dataset)} images...")
 
-    with torch.no_grad():
-        pbar = tqdm(val_loader, desc="Processing", unit="batch")
-        for batch_idx, (imgs, labels, data_ids) in enumerate(pbar):
-            imgs, labels = imgs.to(device), labels.to(device)
+    pbar = tqdm(loader, desc="Processing", unit="batch")
+    for images, masks, data_ids, orig_hs, orig_ws in pbar:
+        images = images.to(device)
+        batch_size = images.shape[0]
 
-            # Forward pass with TTA (original + horizontal flip)
-            output = backbone_model.forward_features(imgs)["x_norm_patchtokens"]
-            logits = classifier(output)
-            outputs_orig = F.interpolate(logits, size=imgs.shape[2:], mode="bilinear", align_corners=False)
+        # All images are 960x540, use first as reference
+        orig_h = orig_hs[0].item()
+        orig_w = orig_ws[0].item()
 
-            # Horizontal flip TTA
-            imgs_flip = torch.flip(imgs, dims=[3])
-            output_flip = backbone_model.forward_features(imgs_flip)["x_norm_patchtokens"]
-            logits_flip = classifier(output_flip)
-            outputs_flip = F.interpolate(logits_flip, size=imgs.shape[2:], mode="bilinear", align_corners=False)
-            outputs_flip = torch.flip(outputs_flip, dims=[3])  # Flip back
+        # TTA prediction at native resolution
+        probs = predict_with_tta(model, images, orig_h, orig_w)
+        preds = probs.argmax(dim=1)  # (B, orig_h, orig_w) on GPU
 
-            # Average softmax probabilities
-            outputs = (torch.softmax(outputs_orig, dim=1) + torch.softmax(outputs_flip, dim=1)) / 2.0
+        # Compute metrics if GT available
+        gt_valid = masks.dim() > 1 and masks.shape[-1] > 1
+        if gt_valid:
+            has_gt = True
+            masks_gpu = masks.to(device)
 
-            labels_squeezed = labels.squeeze(dim=1).long()
-            predicted_masks = torch.argmax(outputs, dim=1)
+            for c in range(n_classes):
+                pred_c = (preds == c)
+                target_c = (masks_gpu == c)
+                total_inter[c] += (pred_c & target_c).sum().float().cpu()
+                total_union[c] += (pred_c | target_c).sum().float().cpu()
 
-            # Calculate metrics
-            iou, class_iou = compute_iou(outputs, labels_squeezed, num_classes=n_classes)
-            dice, class_dice = compute_dice(outputs, labels_squeezed, num_classes=n_classes)
-            pixel_acc = compute_pixel_accuracy(outputs, labels_squeezed)
+            total_correct += (preds == masks_gpu).sum().float().cpu()
+            total_pixels += masks_gpu.numel()
 
-            iou_scores.append(iou)
-            dice_scores.append(dice)
-            pixel_accuracies.append(pixel_acc)
-            all_class_iou.append(class_iou)
-            all_class_dice.append(class_dice)
+            # Running mIoU for progress bar
+            ious = []
+            for c in range(n_classes):
+                if total_union[c] > 0:
+                    ious.append((total_inter[c] / total_union[c]).item())
+            pbar.set_postfix(miou=f"{np.mean(ious):.3f}" if ious else "N/A")
 
-            # Save predictions for every image
-            for i in range(imgs.shape[0]):
-                data_id = data_ids[i]
-                base_name = os.path.splitext(data_id)[0]
+        preds_np = preds.cpu().numpy()
 
-                # Save raw prediction mask (class IDs 0-9)
-                pred_mask = predicted_masks[i].cpu().numpy().astype(np.uint8)
-                pred_img = Image.fromarray(pred_mask)
-                pred_img.save(os.path.join(masks_dir, f'{base_name}_pred.png'))
+        # Save predictions
+        for i in range(batch_size):
+            data_id = data_ids[i]
+            pred_mask = preds_np[i].astype(np.uint8)
 
-                # Save colored prediction mask (RGB visualization)
-                pred_color = mask_to_color(pred_mask)
-                cv2.imwrite(os.path.join(masks_color_dir, f'{base_name}_pred_color.png'),
-                            cv2.cvtColor(pred_color, cv2.COLOR_RGB2BGR))
+            # Raw mask (class IDs 0-10)
+            cv2.imwrite(os.path.join(masks_dir, f"{data_id}_pred.png"), pred_mask)
 
-                # Save comparison visualization for first N samples
-                if sample_count < args.num_samples:
-                    save_prediction_comparison(
-                        imgs[i], labels_squeezed[i], predicted_masks[i],
-                        os.path.join(comparisons_dir, f'sample_{sample_count}_comparison.png'),
-                        data_id
-                    )
+            # Colored mask
+            color_mask = mask_to_color(pred_mask)
+            cv2.imwrite(os.path.join(color_dir, f"{data_id}_pred_color.png"),
+                        color_mask[:, :, ::-1])  # RGB → BGR for OpenCV
 
-                sample_count += 1
+            # Comparisons (first few with GT)
+            if gt_valid and comparison_count < max_comparisons:
+                gt_mask = masks[i].numpy().astype(np.uint8)
+                img_denorm = denormalize_image(images[i])
+                img_resized = cv2.resize(img_denorm, (orig_w, orig_h))
+                save_comparison(
+                    img_resized, gt_mask, pred_mask,
+                    os.path.join(comp_dir, f"sample_{comparison_count}_comparison.png")
+                )
+                comparison_count += 1
 
-            # Update progress bar with metrics
-            pbar.set_postfix(iou=f"{iou:.3f}")
-
-    # Aggregate results
-    mean_iou = np.nanmean(iou_scores)
-    mean_dice = np.nanmean(dice_scores)
-    mean_pixel_acc = np.mean(pixel_accuracies)
-
-    # Average per-class metrics
-    avg_class_iou = np.nanmean(all_class_iou, axis=0)
-    avg_class_dice = np.nanmean(all_class_dice, axis=0)
-
-    results = {
-        'mean_iou': mean_iou,
-        'class_iou': avg_class_iou
-    }
-
-    # Print results
+    # ==================================================================
+    # Print Results
+    # ==================================================================
     print("\n" + "=" * 50)
     print("EVALUATION RESULTS")
     print("=" * 50)
-    print(f"Mean IoU:          {mean_iou:.4f}")
-    print("=" * 50)
 
-    # Save all results
-    save_metrics_summary(results, args.output_dir)
+    if has_gt:
+        iou_per_class = []
+        for c in range(n_classes):
+            if total_union[c] == 0:
+                iou_per_class.append(float('nan'))
+            else:
+                iou_per_class.append((total_inter[c] / total_union[c]).item())
 
-    print(f"\nPrediction complete! Processed {len(valset)} images.")
-    print(f"\nOutputs saved to {args.output_dir}/")
+        miou = float(np.nanmean(iou_per_class))
+        pixel_acc = (total_correct / total_pixels).item() if total_pixels > 0 else 0
+
+        print(f"Mean IoU:          {miou:.4f}")
+        print(f"Pixel Accuracy:    {pixel_acc:.4f}")
+        print("=" * 50)
+
+        print("\nPer-Class IoU:")
+        print("-" * 40)
+        for i, name in enumerate(class_names):
+            iou = iou_per_class[i]
+            status = f"{iou:.4f}" if not np.isnan(iou) else "N/A"
+            print(f"  {name:20s}: {status}")
+
+        # Save metrics to file
+        metrics_path = os.path.join(pred_dir, 'evaluation_metrics.txt')
+        with open(metrics_path, 'w') as f:
+            f.write("EVALUATION RESULTS\n")
+            f.write("=" * 50 + "\n")
+            f.write(f"Mean IoU:          {miou:.4f}\n")
+            f.write(f"Pixel Accuracy:    {pixel_acc:.4f}\n")
+            f.write("=" * 50 + "\n\n")
+            f.write("Per-Class IoU:\n")
+            f.write("-" * 40 + "\n")
+            for i, name in enumerate(class_names):
+                iou = iou_per_class[i]
+                status = f"{iou:.4f}" if not np.isnan(iou) else "N/A"
+                f.write(f"  {name:20s}: {status}\n")
+        print(f"\nSaved evaluation metrics to {metrics_path}")
+
+        # Per-class IoU bar chart
+        fig, ax = plt.subplots(figsize=(14, 6))
+        colors = ['#333333', '#228B22', '#00FF00', '#D2B48C', '#8B5A2B',
+                  '#808000', '#FF69B4', '#8B4513', '#808080', '#A0522D', '#87CEEB']
+        valid_iou = [x if not np.isnan(x) else 0 for x in iou_per_class]
+        bars = ax.bar(range(n_classes), valid_iou, color=colors)
+        ax.set_xticks(range(n_classes))
+        ax.set_xticklabels(class_names, rotation=45, ha='right')
+        ax.set_ylabel('IoU')
+        ax.set_title(f'Per-Class IoU — mIoU: {miou:.4f}')
+        ax.set_ylim(0, 1)
+        ax.grid(axis='y', alpha=0.3)
+        for bar, val in zip(bars, valid_iou):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
+                    f'{val:.3f}', ha='center', va='bottom', fontsize=9)
+        plt.tight_layout()
+        chart_path = os.path.join(pred_dir, 'per_class_metrics.png')
+        plt.savefig(chart_path, dpi=150)
+        plt.close()
+        print(f"Saved per-class metrics chart to '{chart_path}'")
+    else:
+        print("No ground truth masks available — predictions only.")
+
+    print(f"\nPrediction complete! Processed {len(dataset)} images.")
+    print(f"\nOutputs saved to {pred_dir}/")
     print(f"  - masks/           : Raw prediction masks (class IDs 0-10)")
     print(f"  - masks_color/     : Colored prediction masks (RGB)")
-    print(f"  - comparisons/     : Side-by-side comparison images ({args.num_samples} samples)")
-    print(f"  - evaluation_metrics.txt")
-    print(f"  - per_class_metrics.png")
+    print(f"  - comparisons/     : Side-by-side comparison images")
+    if has_gt:
+        print(f"  - evaluation_metrics.txt")
+        print(f"  - per_class_metrics.png")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
-

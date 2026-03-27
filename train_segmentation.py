@@ -1,50 +1,32 @@
 """
-Segmentation Training Script
-Converted from train_mask.ipynb
-Trains a segmentation head on top of DINOv2 backbone
+Offroad Semantic Segmentation — Training Script
+DeepLabV3-ResNet50 (COCO pretrained) with Two-Phase Training
 """
 
 import torch
-from torch.utils.data import Dataset, DataLoader
-import numpy as np
-from torch import nn
+import torch.nn as nn
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
-import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingLR
-import torchvision.transforms as transforms
+from torch.utils.data import Dataset, DataLoader
+from torch.optim.lr_scheduler import OneCycleLR
+import torchvision.models.segmentation as seg_models
+import numpy as np
 from PIL import Image
 import cv2
 import os
-import torchvision
+import time
 from tqdm import tqdm
 from collections import Counter
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
-# Set matplotlib to non-interactive backend
-plt.switch_backend('Agg')
-
 
 # ============================================================================
-# Utility Functions
+# Class Definitions
 # ============================================================================
 
-def save_image(img, filename):
-    """Save an image tensor to file after denormalizing."""
-    img = np.array(img)
-    mean = np.array([0.485, 0.456, 0.406])
-    std = np.array([0.229, 0.224, 0.225])
-    img = np.moveaxis(img, 0, -1)
-    img = (img * std + mean) * 255
-    cv2.imwrite(filename, img[:, :, ::-1])
-
-
-# ============================================================================
-# Mask Conversion
-# ============================================================================
-
-# Mapping from raw pixel values to new class IDs
 value_map = {
     0: 0,        # Background
     100: 1,      # Trees
@@ -56,18 +38,15 @@ value_map = {
     700: 7,      # Logs
     800: 8,      # Rocks
     7100: 9,     # Landscape
-    10000: 10    # Sky
+    10000: 10,   # Sky
 }
-n_classes = len(value_map)
 
+n_classes = 11
 
-def convert_mask(mask):
-    """Convert raw mask values to class IDs."""
-    arr = np.array(mask)
-    new_arr = np.zeros_like(arr, dtype=np.uint8)
-    for raw_value, new_value in value_map.items():
-        new_arr[arr == raw_value] = new_value
-    return Image.fromarray(new_arr)
+class_names = [
+    "Background", "Trees", "Lush Bushes", "Dry Grass", "Dry Bushes",
+    "Ground Clutter", "Flowers", "Logs", "Rocks", "Landscape", "Sky"
+]
 
 
 # ============================================================================
@@ -76,684 +55,555 @@ def convert_mask(mask):
 
 class MaskDataset(Dataset):
     def __init__(self, data_dir, transform=None):
-        self.image_dir = os.path.join(data_dir, 'Color_Images')
-        self.masks_dir = os.path.join(data_dir, 'Segmentation')
+        self.img_dir = os.path.join(data_dir, 'Color_Images')
+        self.mask_dir = os.path.join(data_dir, 'Segmentation')
+        self.img_names = sorted(os.listdir(self.img_dir))
         self.transform = transform
-        self.data_ids = os.listdir(self.image_dir)
 
     def __len__(self):
-        return len(self.data_ids)
+        return len(self.img_names)
 
     def __getitem__(self, idx):
-        data_id = self.data_ids[idx]
-        img_path = os.path.join(self.image_dir, data_id)
-        mask_path = os.path.join(self.masks_dir, data_id)
+        img_name = self.img_names[idx]
+        img_path = os.path.join(self.img_dir, img_name)
+        mask_path = os.path.join(self.mask_dir, img_name)
 
         image = np.array(Image.open(img_path).convert("RGB"))
         mask = np.array(Image.open(mask_path))
 
-        # Convert raw mask values to class IDs
-        new_mask = np.zeros_like(mask, dtype=np.uint8)
-        for raw_value, new_value in value_map.items():
-            new_mask[mask == raw_value] = new_value
+        # Map raw pixel values to class IDs 0-10
+        new_mask = np.zeros(mask.shape[:2], dtype=np.uint8)
+        for raw_value, class_id in value_map.items():
+            new_mask[mask == raw_value] = class_id
 
         if self.transform:
             transformed = self.transform(image=image, mask=new_mask)
             image = transformed['image']
             new_mask = transformed['mask'].long()
 
-        return image, new_mask.unsqueeze(0) if new_mask.dim() == 2 else new_mask
+        return image, new_mask
 
 
 # ============================================================================
-# Model: Segmentation Head (ConvNeXt-style)
+# Loss Functions
 # ============================================================================
 
-class ConvNeXtBlock(nn.Module):
-    """ConvNeXt-style block with residual connection and LayerNorm."""
-    def __init__(self, dim):
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0):
         super().__init__()
-        self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
-        self.norm = nn.GroupNorm(1, dim)  # Equivalent to LayerNorm for conv
-        self.pwconv1 = nn.Conv2d(dim, dim * 4, kernel_size=1)
-        self.act = nn.GELU()
-        self.pwconv2 = nn.Conv2d(dim * 4, dim, kernel_size=1)
-
-    def forward(self, x):
-        residual = x
-        x = self.dwconv(x)
-        x = self.norm(x)
-        x = self.pwconv1(x)
-        x = self.act(x)
-        x = self.pwconv2(x)
-        return x + residual
-
-
-class SegmentationHeadConvNeXt(nn.Module):
-    def __init__(self, in_channels, out_channels, tokenW, tokenH):
-        super().__init__()
-        self.H, self.W = tokenH, tokenW
-        hidden_dim = 256
-
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, hidden_dim, kernel_size=7, padding=3),
-            nn.GroupNorm(1, hidden_dim),
-            nn.GELU()
-        )
-
-        self.block1 = ConvNeXtBlock(hidden_dim)
-        self.block2 = ConvNeXtBlock(hidden_dim)
-
-        self.dropout = nn.Dropout2d(0.1)
-        self.classifier = nn.Conv2d(hidden_dim, out_channels, 1)
-
-    def forward(self, x):
-        B, N, C = x.shape
-        x = x.reshape(B, self.H, self.W, C).permute(0, 3, 1, 2)
-        x = self.stem(x)
-        x = self.block1(x)
-        x = self.block2(x)
-        x = self.dropout(x)
-        return self.classifier(x)
-
-
-# ============================================================================
-# Metrics
-# ============================================================================
-
-def compute_iou(pred, target, num_classes=10, ignore_index=255):
-    """Compute IoU for each class and return mean IoU."""
-    pred = torch.argmax(pred, dim=1)
-    pred, target = pred.view(-1), target.view(-1)
-
-    iou_per_class = []
-    for class_id in range(num_classes):
-        if class_id == ignore_index:
-            continue
-
-        pred_inds = pred == class_id
-        target_inds = target == class_id
-
-        intersection = (pred_inds & target_inds).sum().float()
-        union = (pred_inds | target_inds).sum().float()
-
-        if union == 0:
-            iou_per_class.append(float('nan'))
+        self.gamma = gamma
+        if alpha is not None:
+            self.register_buffer('alpha', alpha)
         else:
-            iou_per_class.append((intersection / union).cpu().numpy())
+            self.alpha = None
 
-    return np.nanmean(iou_per_class)
+    def forward(self, logits, targets):
+        ce_loss = F.cross_entropy(logits, targets, weight=self.alpha, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        return focal_loss.mean()
 
-
-def compute_dice(pred, target, num_classes=10, smooth=1e-6):
-    """Compute Dice coefficient (F1 Score) per class and return mean Dice Score."""
-    pred = torch.argmax(pred, dim=1)
-    pred, target = pred.view(-1), target.view(-1)
-
-    dice_per_class = []
-    for class_id in range(num_classes):
-        pred_inds = pred == class_id
-        target_inds = target == class_id
-
-        intersection = (pred_inds & target_inds).sum().float()
-        dice_score = (2. * intersection + smooth) / (pred_inds.sum().float() + target_inds.sum().float() + smooth)
-
-        dice_per_class.append(dice_score.cpu().numpy())
-
-    return np.mean(dice_per_class)
-
-
-def compute_pixel_accuracy(pred, target):
-    """Compute pixel accuracy."""
-    pred_classes = torch.argmax(pred, dim=1)
-    return (pred_classes == target).float().mean().cpu().numpy()
-
-
-def evaluate_metrics(model, backbone, data_loader, device, num_classes=10, show_progress=True):
-    """Evaluate all metrics on a dataset."""
-    iou_scores = []
-    dice_scores = []
-    pixel_accuracies = []
-
-    model.eval()
-    loader = tqdm(data_loader, desc="Evaluating", leave=False, unit="batch") if show_progress else data_loader
-    with torch.no_grad():
-        for imgs, labels in loader:
-            imgs, labels = imgs.to(device), labels.to(device)
-
-            output = backbone.forward_features(imgs)["x_norm_patchtokens"]
-            logits = model(output.to(device))
-            outputs = F.interpolate(logits, size=imgs.shape[2:], mode="bilinear", align_corners=False)
-
-            labels = labels.squeeze(dim=1).long()
-
-            iou = compute_iou(outputs, labels, num_classes=num_classes)
-            dice = compute_dice(outputs, labels, num_classes=num_classes)
-            pixel_acc = compute_pixel_accuracy(outputs, labels)
-
-            iou_scores.append(iou)
-            dice_scores.append(dice)
-            pixel_accuracies.append(pixel_acc)
-
-    model.train()
-    return np.mean(iou_scores), np.mean(dice_scores), np.mean(pixel_accuracies)
-
-
-# ============================================================================
-# Plotting Functions
-# ============================================================================
-
-def save_training_plots(history, output_dir):
-    """Save all training metric plots to files."""
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Plot 1: Loss curves
-    plt.figure(figsize=(12, 5))
-    
-    plt.subplot(1, 2, 1)
-    plt.plot(history['train_loss'], label='train')
-    plt.plot(history['val_loss'], label='val')
-    plt.title('Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.grid(True)
-    
-    plt.subplot(1, 2, 2)
-    plt.plot(history['train_pixel_acc'], label='train')
-    plt.plot(history['val_pixel_acc'], label='val')
-    plt.title('Pixel Accuracy')
-    plt.xlabel('Epoch')
-    plt.ylabel('Accuracy')
-    plt.legend()
-    plt.grid(True)
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'training_curves.png'))
-    plt.close()
-    print(f"Saved training curves to '{output_dir}/training_curves.png'")
-
-    # Plot 2: IoU curves
-    plt.figure(figsize=(12, 5))
-    
-    plt.subplot(1, 2, 1)
-    plt.plot(history['train_iou'], label='Train IoU')
-    plt.title('Train IoU vs Epoch')
-    plt.xlabel('Epoch')
-    plt.ylabel('IoU')
-    plt.legend()
-    plt.grid(True)
-    
-    plt.subplot(1, 2, 2)
-    plt.plot(history['val_iou'], label='Val IoU')
-    plt.title('Validation IoU vs Epoch')
-    plt.xlabel('Epoch')
-    plt.ylabel('IoU')
-    plt.legend()
-    plt.grid(True)
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'iou_curves.png'))
-    plt.close()
-    print(f"Saved IoU curves to '{output_dir}/iou_curves.png'")
-
-    # Plot 3: Dice curves
-    plt.figure(figsize=(12, 5))
-    
-    plt.subplot(1, 2, 1)
-    plt.plot(history['train_dice'], label='Train Dice')
-    plt.title('Train Dice vs Epoch')
-    plt.xlabel('Epoch')
-    plt.ylabel('Dice Score')
-    plt.legend()
-    plt.grid(True)
-    
-    plt.subplot(1, 2, 2)
-    plt.plot(history['val_dice'], label='Val Dice')
-    plt.title('Validation Dice vs Epoch')
-    plt.xlabel('Epoch')
-    plt.ylabel('Dice Score')
-    plt.legend()
-    plt.grid(True)
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'dice_curves.png'))
-    plt.close()
-    print(f"Saved Dice curves to '{output_dir}/dice_curves.png'")
-
-    # Plot 4: Combined metrics plot
-    plt.figure(figsize=(12, 10))
-
-    plt.subplot(2, 2, 1)
-    plt.plot(history['train_loss'], label='train')
-    plt.plot(history['val_loss'], label='val')
-    plt.title('Loss vs Epoch')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.grid(True)
-
-    plt.subplot(2, 2, 2)
-    plt.plot(history['train_iou'], label='train')
-    plt.plot(history['val_iou'], label='val')
-    plt.title('IoU vs Epoch')
-    plt.xlabel('Epoch')
-    plt.ylabel('IoU')
-    plt.legend()
-    plt.grid(True)
-
-    plt.subplot(2, 2, 3)
-    plt.plot(history['train_dice'], label='train')
-    plt.plot(history['val_dice'], label='val')
-    plt.title('Dice Score vs Epoch')
-    plt.xlabel('Epoch')
-    plt.ylabel('Dice Score')
-    plt.legend()
-    plt.grid(True)
-
-    plt.subplot(2, 2, 4)
-    plt.plot(history['train_pixel_acc'], label='train')
-    plt.plot(history['val_pixel_acc'], label='val')
-    plt.title('Pixel Accuracy vs Epoch')
-    plt.xlabel('Epoch')
-    plt.ylabel('Pixel Accuracy')
-    plt.legend()
-    plt.grid(True)
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'all_metrics_curves.png'))
-    plt.close()
-    print(f"Saved combined metrics curves to '{output_dir}/all_metrics_curves.png'")
-
-
-def save_history_to_file(history, output_dir):
-    """Save training history to a text file."""
-    os.makedirs(output_dir, exist_ok=True)
-    filepath = os.path.join(output_dir, 'evaluation_metrics.txt')
-
-    with open(filepath, 'w') as f:
-        f.write("TRAINING RESULTS\n")
-        f.write("=" * 50 + "\n\n")
-
-        f.write("Final Metrics:\n")
-        f.write(f"  Final Train Loss:     {history['train_loss'][-1]:.4f}\n")
-        f.write(f"  Final Val Loss:       {history['val_loss'][-1]:.4f}\n")
-        f.write(f"  Final Train IoU:      {history['train_iou'][-1]:.4f}\n")
-        f.write(f"  Final Val IoU:        {history['val_iou'][-1]:.4f}\n")
-        f.write(f"  Final Train Dice:     {history['train_dice'][-1]:.4f}\n")
-        f.write(f"  Final Val Dice:       {history['val_dice'][-1]:.4f}\n")
-        f.write(f"  Final Train Accuracy: {history['train_pixel_acc'][-1]:.4f}\n")
-        f.write(f"  Final Val Accuracy:   {history['val_pixel_acc'][-1]:.4f}\n")
-        f.write("=" * 50 + "\n\n")
-
-        f.write("Best Results:\n")
-        f.write(f"  Best Val IoU:      {max(history['val_iou']):.4f} (Epoch {np.argmax(history['val_iou']) + 1})\n")
-        f.write(f"  Best Val Dice:     {max(history['val_dice']):.4f} (Epoch {np.argmax(history['val_dice']) + 1})\n")
-        f.write(f"  Best Val Accuracy: {max(history['val_pixel_acc']):.4f} (Epoch {np.argmax(history['val_pixel_acc']) + 1})\n")
-        f.write(f"  Lowest Val Loss:   {min(history['val_loss']):.4f} (Epoch {np.argmin(history['val_loss']) + 1})\n")
-        f.write("=" * 50 + "\n\n")
-
-        f.write("Per-Epoch History:\n")
-        f.write("-" * 100 + "\n")
-        headers = ['Epoch', 'Train Loss', 'Val Loss', 'Train IoU', 'Val IoU',
-                   'Train Dice', 'Val Dice', 'Train Acc', 'Val Acc']
-        f.write("{:<8} {:<12} {:<12} {:<12} {:<12} {:<12} {:<12} {:<12} {:<12}\n".format(*headers))
-        f.write("-" * 100 + "\n")
-
-        n_epochs = len(history['train_loss'])
-        for i in range(n_epochs):
-            f.write("{:<8} {:<12.4f} {:<12.4f} {:<12.4f} {:<12.4f} {:<12.4f} {:<12.4f} {:<12.4f} {:<12.4f}\n".format(
-                i + 1,
-                history['train_loss'][i],
-                history['val_loss'][i],
-                history['train_iou'][i],
-                history['val_iou'][i],
-                history['train_dice'][i],
-                history['val_dice'][i],
-                history['train_pixel_acc'][i],
-                history['val_pixel_acc'][i]
-            ))
-
-    print(f"Saved evaluation metrics to {filepath}")
-
-
-# ============================================================================
-# Combined Loss: Weighted CE + Dice
-# ============================================================================
 
 class DiceLoss(nn.Module):
-    """Soft Dice loss for semantic segmentation."""
-    def __init__(self, num_classes, smooth=1e-6):
+    def __init__(self, num_classes, smooth=1.0):
         super().__init__()
         self.num_classes = num_classes
         self.smooth = smooth
 
     def forward(self, logits, targets):
-        probs = torch.softmax(logits, dim=1)
-        targets_onehot = F.one_hot(targets, self.num_classes).permute(0, 3, 1, 2).float()
+        probs = F.softmax(logits, dim=1)
+        targets_one_hot = F.one_hot(targets, self.num_classes).permute(0, 3, 1, 2).float()
 
         dims = (0, 2, 3)
-        intersection = (probs * targets_onehot).sum(dim=dims)
-        cardinality = (probs + targets_onehot).sum(dim=dims)
+        intersection = (probs * targets_one_hot).sum(dims)
+        cardinality = (probs + targets_one_hot).sum(dims)
 
         dice = (2.0 * intersection + self.smooth) / (cardinality + self.smooth)
         return 1.0 - dice.mean()
 
 
 class CombinedLoss(nn.Module):
-    """Weighted CrossEntropy + Dice loss."""
-    def __init__(self, num_classes, class_weights=None, ce_weight=0.5, dice_weight=0.5):
+    def __init__(self, num_classes, class_weights=None, focal_weight=0.5, dice_weight=0.5, gamma=2.0):
         super().__init__()
-        self.ce = nn.CrossEntropyLoss(weight=class_weights)
+        self.focal = FocalLoss(alpha=class_weights, gamma=gamma)
         self.dice = DiceLoss(num_classes)
-        self.ce_weight = ce_weight
+        self.focal_weight = focal_weight
         self.dice_weight = dice_weight
 
     def forward(self, logits, targets):
-        return self.ce_weight * self.ce(logits, targets) + self.dice_weight * self.dice(logits, targets)
+        return self.focal_weight * self.focal(logits, targets) + \
+               self.dice_weight * self.dice(logits, targets)
 
 
 # ============================================================================
 # Class Weight Computation
 # ============================================================================
 
-def compute_class_weights(data_dir, num_samples=200):
-    """Scan training masks to compute inverse-frequency class weights."""
+def compute_class_weights(data_dir, num_classes=11):
+    """Scan ALL training masks, compute sqrt-inverse-frequency weights."""
     masks_dir = os.path.join(data_dir, 'Segmentation')
-    mask_files = os.listdir(masks_dir)[:num_samples]
+    mask_files = sorted(os.listdir(masks_dir))
 
     pixel_counts = Counter()
-    for fname in tqdm(mask_files, desc="Computing class weights", leave=False):
-        mask = Image.open(os.path.join(masks_dir, fname))
-        arr = np.array(mask)
-        new_arr = np.zeros_like(arr, dtype=np.uint8)
-        for raw_value, new_value in value_map.items():
-            new_arr[arr == raw_value] = new_value
-        unique, counts = np.unique(new_arr, return_counts=True)
+    for fname in tqdm(mask_files, desc="Computing class weights"):
+        mask = np.array(Image.open(os.path.join(masks_dir, fname)))
+        new_mask = np.zeros(mask.shape[:2], dtype=np.uint8)
+        for raw_value, class_id in value_map.items():
+            new_mask[mask == raw_value] = class_id
+        unique, counts = np.unique(new_mask, return_counts=True)
         for u, c in zip(unique, counts):
             pixel_counts[int(u)] += c
 
     total = sum(pixel_counts.values())
-    n = len(value_map)
-    weights = torch.ones(n)
-    for cls_id, count in pixel_counts.items():
-        if cls_id < n and count > 0:
-            freq = count / total
-            weights[cls_id] = 1.0 / (freq * n)
+    freqs = []
+    for c in range(num_classes):
+        freqs.append(pixel_counts.get(c, 0) / total if total > 0 else 0)
 
-    # Clamp to avoid extreme weights
-    weights = weights.clamp(min=0.5, max=10.0)
-    print(f"Class weights: {weights.tolist()}")
+    # sqrt-inverse-frequency with median dampening
+    positive_freqs = [f for f in freqs if f > 0]
+    median_freq = np.median(positive_freqs) if positive_freqs else 1.0
+    weights = torch.ones(num_classes)
+    for c in range(num_classes):
+        if freqs[c] > 0:
+            weights[c] = np.sqrt(median_freq / freqs[c])
+        else:
+            weights[c] = 0.5  # Background or absent class
+
+    weights = weights.clamp(min=0.5, max=20.0)
+    print(f"Class weights: {[f'{w:.2f}' for w in weights.tolist()]}")
     return weights
 
 
 # ============================================================================
-# Main Training Function
+# Metrics — Global Accumulation (statistically correct)
 # ============================================================================
 
-def main():
-    # Configuration
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+def compute_metrics_batch(pred_logits, targets, num_classes):
+    """Returns per-class intersection and union for a single batch."""
+    pred = torch.argmax(pred_logits, dim=1)
+    intersections = torch.zeros(num_classes)
+    unions = torch.zeros(num_classes)
 
-    # Hyperparameters
-    batch_size = 2
-    scale = 0.7  # Higher resolution for better detail (was 0.5)
-    w = int(((960 * scale) // 14) * 14)   # 672
-    h = int(((540 * scale) // 14) * 14)   # 378
-    lr = 1e-3
-    n_epochs = 50
-    patience = 10  # Early stopping patience
+    for c in range(num_classes):
+        pred_c = (pred == c)
+        target_c = (targets == c)
+        intersections[c] = (pred_c & target_c).sum().float().cpu()
+        unions[c] = (pred_c | target_c).sum().float().cpu()
 
-    # Output directory (relative to script location)
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    output_dir = os.path.join(script_dir, 'train_stats')
+    correct = (pred == targets).sum().float().cpu()
+    total = targets.numel()
+    return intersections, unions, correct, total
+
+
+def compute_miou_from_accumulated(total_intersection, total_union):
+    """Compute per-class IoU and mIoU from accumulated totals."""
+    iou_per_class = []
+    for c in range(len(total_intersection)):
+        if total_union[c] == 0:
+            iou_per_class.append(float('nan'))
+        else:
+            iou_per_class.append((total_intersection[c] / total_union[c]).item())
+    miou = float(np.nanmean(iou_per_class))
+    return miou, iou_per_class
+
+
+# ============================================================================
+# Model
+# ============================================================================
+
+def create_model(num_classes=11):
+    model = seg_models.deeplabv3_resnet50(weights='DEFAULT')
+    # Replace classification heads for our 11 classes
+    model.classifier[4] = nn.Conv2d(256, num_classes, kernel_size=1)
+    model.aux_classifier[4] = nn.Conv2d(256, num_classes, kernel_size=1)
+    return model
+
+
+# ============================================================================
+# Plotting
+# ============================================================================
+
+def save_training_plots(history, output_dir):
     os.makedirs(output_dir, exist_ok=True)
 
-    # Transforms (albumentations)
-    train_transform = A.Compose([
-        A.Resize(h, w),
-        A.HorizontalFlip(p=0.5),
-        A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
-        A.HueSaturationValue(p=0.3),
-        A.GaussNoise(p=0.2),
-        A.Affine(shift_limit=0.05, scale_limit=0.1, rotate_limit=15, p=0.3),
-        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ToTensorV2(),
-    ])
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
-    val_transform = A.Compose([
-        A.Resize(h, w),
-        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ToTensorV2(),
-    ])
+    axes[0].plot(history['train_loss'], label='Train')
+    axes[0].plot(history['val_loss'], label='Val')
+    axes[0].set_title('Loss')
+    axes[0].set_xlabel('Epoch')
+    axes[0].legend()
+    axes[0].grid(True)
 
-    # Dataset paths (relative to script location)
-    data_dir = os.path.join(script_dir, 'Offroad_Segmentation_Training_Dataset', 'train')
-    val_dir = os.path.join(script_dir, 'Offroad_Segmentation_Training_Dataset', 'val')
+    axes[1].plot(history['val_miou'], label='Val mIoU', color='green')
+    axes[1].set_title('Validation mIoU')
+    axes[1].set_xlabel('Epoch')
+    axes[1].legend()
+    axes[1].grid(True)
 
-    # Create datasets
-    trainset = MaskDataset(data_dir=data_dir, transform=train_transform)
-    train_loader = DataLoader(trainset, batch_size=batch_size, shuffle=True,
-                              num_workers=0, pin_memory=True)
+    axes[2].plot(history['val_pixel_acc'], label='Val Pixel Acc', color='orange')
+    axes[2].set_title('Validation Pixel Accuracy')
+    axes[2].set_xlabel('Epoch')
+    axes[2].legend()
+    axes[2].grid(True)
 
-    valset = MaskDataset(data_dir=val_dir, transform=val_transform)
-    val_loader = DataLoader(valset, batch_size=batch_size, shuffle=False,
-                            num_workers=0, pin_memory=True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'training_curves.png'), dpi=150)
+    plt.close()
 
-    print(f"Training samples: {len(trainset)}")
-    print(f"Validation samples: {len(valset)}")
+    # Per-class IoU bar chart (final epoch)
+    if history.get('val_per_class_iou'):
+        last_iou = history['val_per_class_iou'][-1]
+        fig, ax = plt.subplots(figsize=(14, 6))
+        colors = ['#333333', '#228B22', '#00FF00', '#D2B48C', '#8B5A2B',
+                  '#808000', '#FF69B4', '#8B4513', '#808080', '#A0522D', '#87CEEB']
+        valid_iou = [x if not np.isnan(x) else 0 for x in last_iou]
+        bars = ax.bar(range(n_classes), valid_iou, color=colors)
+        ax.set_xticks(range(n_classes))
+        ax.set_xticklabels(class_names, rotation=45, ha='right')
+        ax.set_ylabel('IoU')
+        ax.set_title(f'Per-Class IoU (Final) — mIoU: {np.nanmean(last_iou):.4f}')
+        ax.set_ylim(0, 1)
+        ax.grid(axis='y', alpha=0.3)
+        for bar, val in zip(bars, valid_iou):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
+                    f'{val:.3f}', ha='center', va='bottom', fontsize=9)
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'per_class_iou.png'), dpi=150)
+        plt.close()
 
-    # Load DINOv2 backbone
-    print("Loading DINOv2 backbone...")
-    BACKBONE_SIZE = "small"
-    backbone_archs = {
-        "small": "vits14",
-        "base": "vitb14_reg",
-        "large": "vitl14_reg",
-        "giant": "vitg14_reg",
-    }
-    backbone_arch = backbone_archs[BACKBONE_SIZE]
-    backbone_name = f"dinov2_{backbone_arch}"
+    print(f"Saved training plots to '{output_dir}'")
 
-    backbone_model = torch.hub.load(repo_or_dir="facebookresearch/dinov2", model=backbone_name)
-    backbone_model.to(device)
-    print("Backbone loaded successfully!")
 
-    # Freeze all backbone params, then unfreeze last N blocks
-    n_unfreeze = 4
-    for param in backbone_model.parameters():
-        param.requires_grad = False
-    for block in backbone_model.blocks[-n_unfreeze:]:
-        for param in block.parameters():
-            param.requires_grad = True
-    for param in backbone_model.norm.parameters():
-        param.requires_grad = True
-    backbone_model.train()
+# ============================================================================
+# Training Phase
+# ============================================================================
 
-    n_backbone_trainable = sum(p.numel() for p in backbone_model.parameters() if p.requires_grad)
-    print(f"Unfroze last {n_unfreeze} backbone blocks ({n_backbone_trainable:,} trainable params)")
+def get_param_groups(model, lr):
+    """Create differential learning rate param groups."""
+    encoder_low = []   # layers 1-2, conv1, bn1
+    encoder_high = []  # layers 3-4
+    decoder = []       # classifier, aux_classifier
 
-    # Get embedding dimension from backbone
-    imgs, _ = next(iter(train_loader))
-    imgs = imgs.to(device)
-    with torch.no_grad():
-        output = backbone_model.forward_features(imgs)["x_norm_patchtokens"]
-    n_embedding = output.shape[2]
-    print(f"Embedding dimension: {n_embedding}")
-    print(f"Patch tokens shape: {output.shape}")
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if any(k in name for k in ['backbone.layer1', 'backbone.layer2',
+                                     'backbone.bn1', 'backbone.conv1']):
+            encoder_low.append(param)
+        elif any(k in name for k in ['backbone.layer3', 'backbone.layer4']):
+            encoder_high.append(param)
+        else:
+            decoder.append(param)
 
-    # Create segmentation head
-    classifier = SegmentationHeadConvNeXt(
-        in_channels=n_embedding,
-        out_channels=n_classes,
-        tokenW=w // 14,
-        tokenH=h // 14
-    )
-    classifier = classifier.to(device)
+    return [
+        {'params': encoder_low, 'lr': lr * 0.01},
+        {'params': encoder_high, 'lr': lr * 0.1},
+        {'params': decoder, 'lr': lr},
+    ]
 
-    # Class weights and combined loss
-    print("Computing class weights...")
-    class_weights = compute_class_weights(data_dir)
-    loss_fct = CombinedLoss(num_classes=n_classes, class_weights=class_weights.to(device))
 
-    # Optimizer with differential learning rates
-    backbone_params = [p for p in backbone_model.parameters() if p.requires_grad]
-    optimizer = optim.AdamW([
-        {'params': backbone_params, 'lr': 1e-5},
-        {'params': classifier.parameters(), 'lr': lr},
-    ], weight_decay=0.01)
-    scheduler = CosineAnnealingLR(optimizer, T_max=n_epochs, eta_min=1e-6)
+def train_phase(model, train_loader, val_loader, device, criterion,
+                num_epochs, lr, phase_name, save_path,
+                freeze_epochs=0, patience=10):
+    """Run one training phase. Returns history dict and best mIoU."""
 
-    # Mixed precision
+    # --- Optimizer setup ---
+    if freeze_epochs > 0:
+        for param in model.backbone.parameters():
+            param.requires_grad = False
+        trainable = filter(lambda p: p.requires_grad, model.parameters())
+        optimizer = torch.optim.AdamW(trainable, lr=lr, weight_decay=0.01)
+    else:
+        optimizer = torch.optim.AdamW(get_param_groups(model, lr), weight_decay=0.01)
+
+    total_steps = num_epochs * len(train_loader)
+    scheduler = OneCycleLR(optimizer, max_lr=lr, total_steps=total_steps,
+                           pct_start=0.1, anneal_strategy='cos')
     scaler = torch.amp.GradScaler('cuda')
 
-    # Training history
     history = {
-        'train_loss': [],
-        'val_loss': [],
-        'train_iou': [],
-        'val_iou': [],
-        'train_dice': [],
-        'val_dice': [],
-        'train_pixel_acc': [],
-        'val_pixel_acc': []
+        'train_loss': [], 'val_loss': [], 'val_miou': [],
+        'val_pixel_acc': [], 'val_per_class_iou': []
     }
 
-    # Training loop
-    print("\nStarting training...")
-    print("=" * 80)
+    best_miou = 0.0
+    epochs_no_improve = 0
 
-    best_val_iou = 0.0
-    epochs_without_improvement = 0
+    print(f"\n{'=' * 60}")
+    print(f"  {phase_name}")
+    print(f"{'=' * 60}")
 
-    epoch_pbar = tqdm(range(n_epochs), desc="Training", unit="epoch")
-    for epoch in epoch_pbar:
-        # Training phase
-        classifier.train()
+    for epoch in range(num_epochs):
+        # Unfreeze encoder after warmup
+        if freeze_epochs > 0 and epoch == freeze_epochs:
+            print(f"\n  Unfreezing encoder at epoch {epoch + 1}")
+            for param in model.backbone.parameters():
+                param.requires_grad = True
+            optimizer = torch.optim.AdamW(get_param_groups(model, lr), weight_decay=0.01)
+            remaining_steps = (num_epochs - epoch) * len(train_loader)
+            scheduler = OneCycleLR(optimizer, max_lr=lr, total_steps=remaining_steps,
+                                   pct_start=0.1, anneal_strategy='cos')
+
+        # ---- Training ----
+        model.train()
         train_losses = []
 
-        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{n_epochs} [Train]",
-                          leave=False, unit="batch")
-        for imgs, labels in train_pbar:
-            imgs, labels = imgs.to(device), labels.to(device)
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs} [Train]",
+                    leave=False, unit="batch")
+        for images, masks in pbar:
+            images, masks = images.to(device), masks.to(device)
 
             optimizer.zero_grad()
             with torch.amp.autocast('cuda'):
-                output = backbone_model.forward_features(imgs)["x_norm_patchtokens"]
-                logits = classifier(output)
-                outputs = F.interpolate(logits, size=imgs.shape[2:], mode="bilinear", align_corners=False)
-                labels = labels.squeeze(dim=1).long()
-                loss = loss_fct(outputs, labels)
+                output = model(images)
+                main_loss = criterion(output['out'], masks)
+                aux_loss = criterion(output['aux'], masks)
+                loss = main_loss + 0.4 * aux_loss
 
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
+            scheduler.step()
 
             train_losses.append(loss.item())
-            train_pbar.set_postfix(loss=f"{loss.item():.4f}")
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-        # Validation phase (compute loss + metrics in one pass)
-        classifier.eval()
+        # ---- Validation (single pass with metrics) ----
+        model.eval()
         val_losses = []
-        val_iou_scores = []
-        val_dice_scores = []
-        val_pixel_accs = []
+        total_inter = torch.zeros(n_classes)
+        total_union = torch.zeros(n_classes)
+        total_correct = 0
+        total_pixels = 0
 
-        val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{n_epochs} [Val]",
-                        leave=False, unit="batch")
         with torch.no_grad():
-            for imgs, labels in val_pbar:
-                imgs, labels = imgs.to(device), labels.to(device)
+            for images, masks in tqdm(val_loader, desc=f"Epoch {epoch + 1}/{num_epochs} [Val]",
+                                      leave=False, unit="batch"):
+                images, masks = images.to(device), masks.to(device)
 
-                output = backbone_model.forward_features(imgs)["x_norm_patchtokens"]
                 with torch.amp.autocast('cuda'):
-                    logits = classifier(output.to(device))
-                    outputs = F.interpolate(logits, size=imgs.shape[2:], mode="bilinear", align_corners=False)
-                    labels = labels.squeeze(dim=1).long()
-                    loss = loss_fct(outputs, labels)
+                    output = model(images)
+                    main_loss = criterion(output['out'], masks)
+                    aux_loss = criterion(output['aux'], masks)
+                    loss = main_loss + 0.4 * aux_loss
 
                 val_losses.append(loss.item())
-                val_iou_scores.append(compute_iou(outputs, labels, num_classes=n_classes))
-                val_dice_scores.append(compute_dice(outputs, labels, num_classes=n_classes))
-                val_pixel_accs.append(compute_pixel_accuracy(outputs, labels))
-                val_pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-        val_iou = np.mean(val_iou_scores)
-        val_dice = np.mean(val_dice_scores)
-        val_pixel_acc = np.mean(val_pixel_accs)
+                inter, union, correct, total = compute_metrics_batch(
+                    output['out'], masks, n_classes)
+                total_inter += inter
+                total_union += union
+                total_correct += correct
+                total_pixels += total
 
-        # Step scheduler
-        scheduler.step()
+        miou, per_class_iou = compute_miou_from_accumulated(total_inter, total_union)
+        pixel_acc = (total_correct / total_pixels).item()
 
-        # Store history
         epoch_train_loss = np.mean(train_losses)
         epoch_val_loss = np.mean(val_losses)
 
         history['train_loss'].append(epoch_train_loss)
         history['val_loss'].append(epoch_val_loss)
-        history['train_iou'].append(0.0)  # Skip train eval for speed
-        history['val_iou'].append(val_iou)
-        history['train_dice'].append(0.0)
-        history['val_dice'].append(val_dice)
-        history['train_pixel_acc'].append(0.0)
-        history['val_pixel_acc'].append(val_pixel_acc)
+        history['val_miou'].append(miou)
+        history['val_pixel_acc'].append(pixel_acc)
+        history['val_per_class_iou'].append(per_class_iou)
 
-        # Update epoch progress bar with metrics
-        epoch_pbar.set_postfix(
-            train_loss=f"{epoch_train_loss:.3f}",
-            val_loss=f"{epoch_val_loss:.3f}",
-            val_iou=f"{val_iou:.3f}",
-            val_acc=f"{val_pixel_acc:.3f}",
-            lr=f"{scheduler.get_last_lr()[0]:.2e}"
-        )
+        current_lr = optimizer.param_groups[-1]['lr']
+        print(f"  Epoch {epoch + 1}/{num_epochs} — train_loss: {epoch_train_loss:.4f}, "
+              f"val_loss: {epoch_val_loss:.4f}, val_mIoU: {miou:.4f}, "
+              f"val_acc: {pixel_acc:.4f}, lr: {current_lr:.2e}")
 
-        # Early stopping & best model saving
-        if val_iou > best_val_iou:
-            best_val_iou = val_iou
-            epochs_without_improvement = 0
-            best_model_path = os.path.join(script_dir, "segmentation_head_best.pth")
-            torch.save({
-                'classifier': classifier.state_dict(),
-                'backbone': backbone_model.state_dict(),
-            }, best_model_path)
-            print(f"\n  New best val IoU: {val_iou:.4f} — saved to '{best_model_path}'")
+        # Best model saving + early stopping
+        if miou > best_miou:
+            best_miou = miou
+            epochs_no_improve = 0
+            torch.save(model.state_dict(), save_path)
+            print(f"    >> New best mIoU: {miou:.4f} — saved to '{save_path}'")
         else:
-            epochs_without_improvement += 1
-            if epochs_without_improvement >= patience:
-                print(f"\n  Early stopping at epoch {epoch+1} (no improvement for {patience} epochs)")
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                print(f"    >> Early stopping at epoch {epoch + 1} "
+                      f"(no improvement for {patience} epochs)")
                 break
 
-    # Save plots
+    print(f"\n  {phase_name} complete. Best mIoU: {best_miou:.4f}")
+    return history, best_miou
+
+
+# ============================================================================
+# Main
+# ============================================================================
+
+def main():
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    data_dir = os.path.join(script_dir, 'Offroad_Segmentation_Training_Dataset', 'train')
+    val_dir = os.path.join(script_dir, 'Offroad_Segmentation_Training_Dataset', 'val')
+    output_dir = os.path.join(script_dir, 'train_stats')
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Compute class weights (scans all masks)
+    class_weights = compute_class_weights(data_dir, n_classes).to(device)
+
+    # Create model
+    print("\nCreating DeepLabV3-ResNet50 model (COCO pretrained)...")
+    model = create_model(n_classes).to(device)
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total params: {total_params:,} | Trainable: {trainable_params:,}")
+
+    # Loss
+    criterion = CombinedLoss(n_classes, class_weights=class_weights).to(device)
+
+    # ==================================================================
+    # Phase 1: Low-Resolution Training (416x736)
+    # ==================================================================
+    H1, W1 = 416, 736
+    batch_size_1 = 8
+
+    train_transform_1 = A.Compose([
+        A.Resize(H1, W1),
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.1),
+        A.Affine(shift_limit=0.1, scale_limit=0.2, rotate_limit=20,
+                 border_mode=cv2.BORDER_REFLECT_101, p=0.5),
+        A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.5),
+        A.HueSaturationValue(hue_shift_limit=15, sat_shift_limit=25,
+                             val_shift_limit=15, p=0.4),
+        A.OneOf([
+            A.GaussNoise(p=1.0),
+            A.GaussianBlur(blur_limit=(3, 5), p=1.0),
+            A.MedianBlur(blur_limit=5, p=1.0),
+        ], p=0.3),
+        A.CLAHE(clip_limit=4.0, p=0.2),
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ToTensorV2(),
+    ])
+
+    val_transform_1 = A.Compose([
+        A.Resize(H1, W1),
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ToTensorV2(),
+    ])
+
+    trainset_1 = MaskDataset(data_dir, transform=train_transform_1)
+    valset_1 = MaskDataset(val_dir, transform=val_transform_1)
+    train_loader_1 = DataLoader(trainset_1, batch_size=batch_size_1, shuffle=True,
+                                num_workers=0, pin_memory=True, drop_last=True)
+    val_loader_1 = DataLoader(valset_1, batch_size=batch_size_1, shuffle=False,
+                              num_workers=0, pin_memory=True)
+
+    print(f"\nTraining samples: {len(trainset_1)}")
+    print(f"Validation samples: {len(valset_1)}")
+    print(f"Phase 1 resolution: {W1}x{H1}, batch_size: {batch_size_1}")
+
+    phase1_path = os.path.join(script_dir, 'best_model_phase1.pth')
+    history_1, best_miou_1 = train_phase(
+        model, train_loader_1, val_loader_1, device, criterion,
+        num_epochs=30, lr=3e-4,
+        phase_name="Phase 1: Low-Res Training (416x736)",
+        save_path=phase1_path, freeze_epochs=3, patience=10
+    )
+
+    # ==================================================================
+    # Phase 2: High-Resolution Finetuning (512x896)
+    # ==================================================================
+    torch.cuda.empty_cache()
+
+    H2, W2 = 512, 896
+    batch_size_2 = 4
+
+    train_transform_2 = A.Compose([
+        A.Resize(H2, W2),
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.1),
+        A.Affine(shift_limit=0.1, scale_limit=0.2, rotate_limit=20,
+                 border_mode=cv2.BORDER_REFLECT_101, p=0.5),
+        A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.5),
+        A.HueSaturationValue(hue_shift_limit=15, sat_shift_limit=25,
+                             val_shift_limit=15, p=0.4),
+        A.OneOf([
+            A.GaussNoise(p=1.0),
+            A.GaussianBlur(blur_limit=(3, 5), p=1.0),
+            A.MedianBlur(blur_limit=5, p=1.0),
+        ], p=0.3),
+        A.CLAHE(clip_limit=4.0, p=0.2),
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ToTensorV2(),
+    ])
+
+    val_transform_2 = A.Compose([
+        A.Resize(H2, W2),
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ToTensorV2(),
+    ])
+
+    trainset_2 = MaskDataset(data_dir, transform=train_transform_2)
+    valset_2 = MaskDataset(val_dir, transform=val_transform_2)
+    train_loader_2 = DataLoader(trainset_2, batch_size=batch_size_2, shuffle=True,
+                                num_workers=0, pin_memory=True, drop_last=True)
+    val_loader_2 = DataLoader(valset_2, batch_size=batch_size_2, shuffle=False,
+                              num_workers=0, pin_memory=True)
+
+    # Load best Phase 1 model
+    model.load_state_dict(torch.load(phase1_path, map_location=device, weights_only=True))
+    print(f"\nLoaded best Phase 1 model (mIoU: {best_miou_1:.4f})")
+    print(f"Phase 2 resolution: {W2}x{H2}, batch_size: {batch_size_2}")
+
+    final_path = os.path.join(script_dir, 'segmentation_model_best.pth')
+    history_2, best_miou_2 = train_phase(
+        model, train_loader_2, val_loader_2, device, criterion,
+        num_epochs=15, lr=5e-5,
+        phase_name="Phase 2: High-Res Finetuning (512x896)",
+        save_path=final_path, freeze_epochs=0, patience=10
+    )
+
+    # ==================================================================
+    # Save Results
+    # ==================================================================
+
+    # Combine histories
+    combined = {
+        'train_loss': history_1['train_loss'] + history_2['train_loss'],
+        'val_loss': history_1['val_loss'] + history_2['val_loss'],
+        'val_miou': history_1['val_miou'] + history_2['val_miou'],
+        'val_pixel_acc': history_1['val_pixel_acc'] + history_2['val_pixel_acc'],
+        'val_per_class_iou': history_1['val_per_class_iou'] + history_2['val_per_class_iou'],
+    }
+
     print("\nSaving training curves...")
-    save_training_plots(history, output_dir)
-    save_history_to_file(history, output_dir)
+    save_training_plots(combined, output_dir)
 
-    # Save final model (in scripts directory) — full checkpoint
-    model_path = os.path.join(script_dir, "segmentation_head.pth")
-    torch.save({
-        'classifier': classifier.state_dict(),
-        'backbone': backbone_model.state_dict(),
-    }, model_path)
-    print(f"Saved final model to '{model_path}'")
-
-    # Copy best model as the primary checkpoint
-    best_model_path = os.path.join(script_dir, "segmentation_head_best.pth")
-    if os.path.exists(best_model_path):
+    # Copy best model as primary checkpoint
+    model_path = os.path.join(script_dir, 'segmentation_model.pth')
+    if os.path.exists(final_path):
         import shutil
-        shutil.copy2(best_model_path, model_path)
-        print(f"Copied best model (val IoU={best_val_iou:.4f}) to '{model_path}'")
+        shutil.copy2(final_path, model_path)
+        print(f"Copied best model (mIoU={best_miou_2:.4f}) to '{model_path}'")
+    else:
+        torch.save(model.state_dict(), model_path)
+        print(f"Saved final model to '{model_path}'")
 
-    # Final evaluation
-    print("\nFinal evaluation results:")
-    print(f"  Final Val Loss:     {history['val_loss'][-1]:.4f}")
-    print(f"  Final Val IoU:      {history['val_iou'][-1]:.4f}")
-    print(f"  Final Val Dice:     {history['val_dice'][-1]:.4f}")
-    print(f"  Final Val Accuracy: {history['val_pixel_acc'][-1]:.4f}")
+    # Print final per-class IoU
+    if combined['val_per_class_iou']:
+        last_iou = combined['val_per_class_iou'][-1]
+        print(f"\nFinal evaluation results:")
+        print(f"  Final Val mIoU:      {np.nanmean(last_iou):.4f}")
+        print(f"  Final Val Pixel Acc: {combined['val_pixel_acc'][-1]:.4f}")
+        print(f"\nPer-Class IoU:")
+        print("-" * 40)
+        for i, name in enumerate(class_names):
+            iou = last_iou[i]
+            status = f"{iou:.4f}" if not np.isnan(iou) else "N/A"
+            print(f"  {name:20s}: {status}")
 
     print("\nTraining complete!")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
-
