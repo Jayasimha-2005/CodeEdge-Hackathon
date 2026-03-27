@@ -653,9 +653,12 @@ def main():
             train_losses.append(loss.item())
             train_pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-        # Validation phase
+        # Validation phase (compute loss + metrics in one pass)
         classifier.eval()
         val_losses = []
+        val_iou_scores = []
+        val_dice_scores = []
+        val_pixel_accs = []
 
         val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{n_epochs} [Val]",
                         leave=False, unit="batch")
@@ -671,12 +674,14 @@ def main():
                     loss = loss_fct(outputs, labels)
 
                 val_losses.append(loss.item())
+                val_iou_scores.append(compute_iou(outputs, labels, num_classes=n_classes))
+                val_dice_scores.append(compute_dice(outputs, labels, num_classes=n_classes))
+                val_pixel_accs.append(compute_pixel_accuracy(outputs, labels))
                 val_pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-        # Calculate metrics (only on validation set to save time)
-        val_iou, val_dice, val_pixel_acc = evaluate_metrics(
-            classifier, backbone_model, val_loader, device, num_classes=n_classes
-        )
+        val_iou = np.mean(val_iou_scores)
+        val_dice = np.mean(val_dice_scores)
+        val_pixel_acc = np.mean(val_pixel_accs)
 
         # Step scheduler
         scheduler.step()
