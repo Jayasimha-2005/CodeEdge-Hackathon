@@ -16,6 +16,8 @@ import cv2
 import os
 import argparse
 from tqdm import tqdm
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 
 # Set matplotlib to non-interactive backend
 plt.switch_backend('Agg')
@@ -42,27 +44,28 @@ def save_image(img, filename):
 
 # Mapping from raw pixel values to new class IDs
 value_map = {
-    0: 0,        # background
+    0: 0,        # Background
     100: 1,      # Trees
     200: 2,      # Lush Bushes
     300: 3,      # Dry Grass
     500: 4,      # Dry Bushes
     550: 5,      # Ground Clutter
-    700: 6,      # Logs
-    800: 7,      # Rocks
-    7100: 8,     # Landscape
-    10000: 9     # Sky
+    600: 6,      # Flowers
+    700: 7,      # Logs
+    800: 8,      # Rocks
+    7100: 9,     # Landscape
+    10000: 10    # Sky
 }
 
 # Class names for visualization
 class_names = [
     'Background', 'Trees', 'Lush Bushes', 'Dry Grass', 'Dry Bushes',
-    'Ground Clutter', 'Logs', 'Rocks', 'Landscape', 'Sky'
+    'Ground Clutter', 'Flowers', 'Logs', 'Rocks', 'Landscape', 'Sky'
 ]
 
 n_classes = len(value_map)
 
-# Color palette for visualization (10 distinct colors)
+# Color palette for visualization (11 distinct colors)
 color_palette = np.array([
     [0, 0, 0],        # Background - black
     [34, 139, 34],    # Trees - forest green
@@ -70,6 +73,7 @@ color_palette = np.array([
     [210, 180, 140],  # Dry Grass - tan
     [139, 90, 43],    # Dry Bushes - brown
     [128, 128, 0],    # Ground Clutter - olive
+    [255, 105, 180],  # Flowers - hot pink
     [139, 69, 19],    # Logs - saddle brown
     [128, 128, 128],  # Rocks - gray
     [160, 82, 45],    # Landscape - sienna
@@ -100,11 +104,10 @@ def mask_to_color(mask):
 # ============================================================================
 
 class MaskDataset(Dataset):
-    def __init__(self, data_dir, transform=None, mask_transform=None):
+    def __init__(self, data_dir, transform=None):
         self.image_dir = os.path.join(data_dir, 'Color_Images')
         self.masks_dir = os.path.join(data_dir, 'Segmentation')
         self.transform = transform
-        self.mask_transform = mask_transform
         self.data_ids = os.listdir(self.image_dir)
 
     def __len__(self):
@@ -113,48 +116,73 @@ class MaskDataset(Dataset):
     def __getitem__(self, idx):
         data_id = self.data_ids[idx]
         img_path = os.path.join(self.image_dir, data_id)
-        # Both color images and masks are .png files with same name
         mask_path = os.path.join(self.masks_dir, data_id)
 
-        image = Image.open(img_path).convert("RGB")
-        mask = Image.open(mask_path)
-        mask = convert_mask(mask)
+        image = np.array(Image.open(img_path).convert("RGB"))
+        mask = np.array(Image.open(mask_path))
+
+        # Convert raw mask values to class IDs
+        new_mask = np.zeros_like(mask, dtype=np.uint8)
+        for raw_value, new_value in value_map.items():
+            new_mask[mask == raw_value] = new_value
 
         if self.transform:
-            image = self.transform(image)
-            mask = self.mask_transform(mask) * 255
+            transformed = self.transform(image=image, mask=new_mask)
+            image = transformed['image']
+            new_mask = transformed['mask'].long()
 
-        return image, mask, data_id
+        return image, new_mask.unsqueeze(0) if new_mask.dim() == 2 else new_mask, data_id
 
 
 # ============================================================================
 # Model: Segmentation Head (ConvNeXt-style) - Must match training
 # ============================================================================
 
+class ConvNeXtBlock(nn.Module):
+    """ConvNeXt-style block with residual connection and LayerNorm."""
+    def __init__(self, dim):
+        super().__init__()
+        self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
+        self.norm = nn.GroupNorm(1, dim)
+        self.pwconv1 = nn.Conv2d(dim, dim * 4, kernel_size=1)
+        self.act = nn.GELU()
+        self.pwconv2 = nn.Conv2d(dim * 4, dim, kernel_size=1)
+
+    def forward(self, x):
+        residual = x
+        x = self.dwconv(x)
+        x = self.norm(x)
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.pwconv2(x)
+        return x + residual
+
+
 class SegmentationHeadConvNeXt(nn.Module):
     def __init__(self, in_channels, out_channels, tokenW, tokenH):
         super().__init__()
         self.H, self.W = tokenH, tokenW
+        hidden_dim = 256
 
         self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, 128, kernel_size=7, padding=3),
+            nn.Conv2d(in_channels, hidden_dim, kernel_size=7, padding=3),
+            nn.GroupNorm(1, hidden_dim),
             nn.GELU()
         )
 
-        self.block = nn.Sequential(
-            nn.Conv2d(128, 128, kernel_size=7, padding=3, groups=128),
-            nn.GELU(),
-            nn.Conv2d(128, 128, kernel_size=1),
-            nn.GELU(),
-        )
+        self.block1 = ConvNeXtBlock(hidden_dim)
+        self.block2 = ConvNeXtBlock(hidden_dim)
 
-        self.classifier = nn.Conv2d(128, out_channels, 1)
+        self.dropout = nn.Dropout2d(0.1)
+        self.classifier = nn.Conv2d(hidden_dim, out_channels, 1)
 
     def forward(self, x):
         B, N, C = x.shape
         x = x.reshape(B, self.H, self.W, C).permute(0, 3, 1, 2)
         x = self.stem(x)
-        x = self.block(x)
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.dropout(x)
         return self.classifier(x)
 
 
@@ -320,24 +348,20 @@ def main():
     print(f"Using device: {device}")
 
     # Image dimensions (must match training)
-    w = int(((960 / 2) // 14) * 14)
-    h = int(((540 / 2) // 14) * 14)
+    scale = 0.7
+    w = int(((960 * scale) // 14) * 14)   # 672
+    h = int(((540 * scale) // 14) * 14)   # 378
 
-    # Transforms
-    transform = transforms.Compose([
-        transforms.Resize((h, w)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-
-    mask_transform = transforms.Compose([
-        transforms.Resize((h, w)),
-        transforms.ToTensor(),
+    # Transforms (albumentations, must match training val transform)
+    val_transform = A.Compose([
+        A.Resize(h, w),
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ToTensorV2(),
     ])
 
     # Create dataset
     print(f"Loading dataset from {args.data_dir}...")
-    valset = MaskDataset(data_dir=args.data_dir, transform=transform, mask_transform=mask_transform)
+    valset = MaskDataset(data_dir=args.data_dir, transform=val_transform)
     val_loader = DataLoader(valset, batch_size=args.batch_size, shuffle=False)
     print(f"Loaded {len(valset)} samples")
 
@@ -354,7 +378,6 @@ def main():
     backbone_name = f"dinov2_{backbone_arch}"
 
     backbone_model = torch.hub.load(repo_or_dir="facebookresearch/dinov2", model=backbone_name)
-    backbone_model.eval()
     backbone_model.to(device)
     print("Backbone loaded successfully!")
 
@@ -366,17 +389,30 @@ def main():
     n_embedding = output.shape[2]
     print(f"Embedding dimension: {n_embedding}")
 
-    # Load classifier
+    # Load checkpoint (supports both old and new format)
     print(f"Loading model from {args.model_path}...")
+    checkpoint = torch.load(args.model_path, map_location=device)
+
     classifier = SegmentationHeadConvNeXt(
         in_channels=n_embedding,
         out_channels=n_classes,
         tokenW=w // 14,
         tokenH=h // 14
     )
-    classifier.load_state_dict(torch.load(args.model_path, map_location=device))
+
+    if isinstance(checkpoint, dict) and 'classifier' in checkpoint:
+        # New format: full checkpoint with backbone + classifier
+        classifier.load_state_dict(checkpoint['classifier'])
+        backbone_model.load_state_dict(checkpoint['backbone'])
+        print("Loaded full checkpoint (backbone + classifier)")
+    else:
+        # Legacy format: classifier-only state_dict
+        classifier.load_state_dict(checkpoint)
+        print("Loaded legacy classifier-only checkpoint")
+
     classifier = classifier.to(device)
     classifier.eval()
+    backbone_model.eval()
     print("Model loaded successfully!")
 
     # Create subdirectories for outputs
@@ -402,10 +438,20 @@ def main():
         for batch_idx, (imgs, labels, data_ids) in enumerate(pbar):
             imgs, labels = imgs.to(device), labels.to(device)
 
-            # Forward pass
+            # Forward pass with TTA (original + horizontal flip)
             output = backbone_model.forward_features(imgs)["x_norm_patchtokens"]
-            logits = classifier(output.to(device))
-            outputs = F.interpolate(logits, size=imgs.shape[2:], mode="bilinear", align_corners=False)
+            logits = classifier(output)
+            outputs_orig = F.interpolate(logits, size=imgs.shape[2:], mode="bilinear", align_corners=False)
+
+            # Horizontal flip TTA
+            imgs_flip = torch.flip(imgs, dims=[3])
+            output_flip = backbone_model.forward_features(imgs_flip)["x_norm_patchtokens"]
+            logits_flip = classifier(output_flip)
+            outputs_flip = F.interpolate(logits_flip, size=imgs.shape[2:], mode="bilinear", align_corners=False)
+            outputs_flip = torch.flip(outputs_flip, dims=[3])  # Flip back
+
+            # Average softmax probabilities
+            outputs = (torch.softmax(outputs_orig, dim=1) + torch.softmax(outputs_flip, dim=1)) / 2.0
 
             labels_squeezed = labels.squeeze(dim=1).long()
             predicted_masks = torch.argmax(outputs, dim=1)
@@ -475,7 +521,7 @@ def main():
 
     print(f"\nPrediction complete! Processed {len(valset)} images.")
     print(f"\nOutputs saved to {args.output_dir}/")
-    print(f"  - masks/           : Raw prediction masks (class IDs 0-9)")
+    print(f"  - masks/           : Raw prediction masks (class IDs 0-10)")
     print(f"  - masks_color/     : Colored prediction masks (RGB)")
     print(f"  - comparisons/     : Side-by-side comparison images ({args.num_samples} samples)")
     print(f"  - evaluation_metrics.txt")

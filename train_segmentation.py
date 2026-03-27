@@ -11,12 +11,16 @@ from torch import nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR
 import torchvision.transforms as transforms
 from PIL import Image
 import cv2
 import os
 import torchvision
 from tqdm import tqdm
+from collections import Counter
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 
 # Set matplotlib to non-interactive backend
 plt.switch_backend('Agg')
@@ -42,16 +46,17 @@ def save_image(img, filename):
 
 # Mapping from raw pixel values to new class IDs
 value_map = {
-    0: 0,        # background
+    0: 0,        # Background
     100: 1,      # Trees
     200: 2,      # Lush Bushes
     300: 3,      # Dry Grass
     500: 4,      # Dry Bushes
     550: 5,      # Ground Clutter
-    700: 6,      # Logs
-    800: 7,      # Rocks
-    7100: 8,     # Landscape
-    10000: 9     # Sky
+    600: 6,      # Flowers
+    700: 7,      # Logs
+    800: 8,      # Rocks
+    7100: 9,     # Landscape
+    10000: 10    # Sky
 }
 n_classes = len(value_map)
 
@@ -70,11 +75,10 @@ def convert_mask(mask):
 # ============================================================================
 
 class MaskDataset(Dataset):
-    def __init__(self, data_dir, transform=None, mask_transform=None):
+    def __init__(self, data_dir, transform=None):
         self.image_dir = os.path.join(data_dir, 'Color_Images')
         self.masks_dir = os.path.join(data_dir, 'Segmentation')
         self.transform = transform
-        self.mask_transform = mask_transform
         self.data_ids = os.listdir(self.image_dir)
 
     def __len__(self):
@@ -83,48 +87,73 @@ class MaskDataset(Dataset):
     def __getitem__(self, idx):
         data_id = self.data_ids[idx]
         img_path = os.path.join(self.image_dir, data_id)
-        # Both color images and masks are .png files with same name
         mask_path = os.path.join(self.masks_dir, data_id)
 
-        image = Image.open(img_path).convert("RGB")
-        mask = Image.open(mask_path)
-        mask = convert_mask(mask)
+        image = np.array(Image.open(img_path).convert("RGB"))
+        mask = np.array(Image.open(mask_path))
+
+        # Convert raw mask values to class IDs
+        new_mask = np.zeros_like(mask, dtype=np.uint8)
+        for raw_value, new_value in value_map.items():
+            new_mask[mask == raw_value] = new_value
 
         if self.transform:
-            image = self.transform(image)
-            mask = self.mask_transform(mask) * 255
+            transformed = self.transform(image=image, mask=new_mask)
+            image = transformed['image']
+            new_mask = transformed['mask'].long()
 
-        return image, mask
+        return image, new_mask.unsqueeze(0) if new_mask.dim() == 2 else new_mask
 
 
 # ============================================================================
 # Model: Segmentation Head (ConvNeXt-style)
 # ============================================================================
 
+class ConvNeXtBlock(nn.Module):
+    """ConvNeXt-style block with residual connection and LayerNorm."""
+    def __init__(self, dim):
+        super().__init__()
+        self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
+        self.norm = nn.GroupNorm(1, dim)  # Equivalent to LayerNorm for conv
+        self.pwconv1 = nn.Conv2d(dim, dim * 4, kernel_size=1)
+        self.act = nn.GELU()
+        self.pwconv2 = nn.Conv2d(dim * 4, dim, kernel_size=1)
+
+    def forward(self, x):
+        residual = x
+        x = self.dwconv(x)
+        x = self.norm(x)
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.pwconv2(x)
+        return x + residual
+
+
 class SegmentationHeadConvNeXt(nn.Module):
     def __init__(self, in_channels, out_channels, tokenW, tokenH):
         super().__init__()
         self.H, self.W = tokenH, tokenW
+        hidden_dim = 256
 
         self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, 128, kernel_size=7, padding=3),
+            nn.Conv2d(in_channels, hidden_dim, kernel_size=7, padding=3),
+            nn.GroupNorm(1, hidden_dim),
             nn.GELU()
         )
 
-        self.block = nn.Sequential(
-            nn.Conv2d(128, 128, kernel_size=7, padding=3, groups=128),
-            nn.GELU(),
-            nn.Conv2d(128, 128, kernel_size=1),
-            nn.GELU(),
-        )
+        self.block1 = ConvNeXtBlock(hidden_dim)
+        self.block2 = ConvNeXtBlock(hidden_dim)
 
-        self.classifier = nn.Conv2d(128, out_channels, 1)
+        self.dropout = nn.Dropout2d(0.1)
+        self.classifier = nn.Conv2d(hidden_dim, out_channels, 1)
 
     def forward(self, x):
         B, N, C = x.shape
         x = x.reshape(B, self.H, self.W, C).permute(0, 3, 1, 2)
         x = self.stem(x)
-        x = self.block(x)
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.dropout(x)
         return self.classifier(x)
 
 
@@ -389,6 +418,76 @@ def save_history_to_file(history, output_dir):
 
 
 # ============================================================================
+# Combined Loss: Weighted CE + Dice
+# ============================================================================
+
+class DiceLoss(nn.Module):
+    """Soft Dice loss for semantic segmentation."""
+    def __init__(self, num_classes, smooth=1e-6):
+        super().__init__()
+        self.num_classes = num_classes
+        self.smooth = smooth
+
+    def forward(self, logits, targets):
+        probs = torch.softmax(logits, dim=1)
+        targets_onehot = F.one_hot(targets, self.num_classes).permute(0, 3, 1, 2).float()
+
+        dims = (0, 2, 3)
+        intersection = (probs * targets_onehot).sum(dim=dims)
+        cardinality = (probs + targets_onehot).sum(dim=dims)
+
+        dice = (2.0 * intersection + self.smooth) / (cardinality + self.smooth)
+        return 1.0 - dice.mean()
+
+
+class CombinedLoss(nn.Module):
+    """Weighted CrossEntropy + Dice loss."""
+    def __init__(self, num_classes, class_weights=None, ce_weight=0.5, dice_weight=0.5):
+        super().__init__()
+        self.ce = nn.CrossEntropyLoss(weight=class_weights)
+        self.dice = DiceLoss(num_classes)
+        self.ce_weight = ce_weight
+        self.dice_weight = dice_weight
+
+    def forward(self, logits, targets):
+        return self.ce_weight * self.ce(logits, targets) + self.dice_weight * self.dice(logits, targets)
+
+
+# ============================================================================
+# Class Weight Computation
+# ============================================================================
+
+def compute_class_weights(data_dir, num_samples=200):
+    """Scan training masks to compute inverse-frequency class weights."""
+    masks_dir = os.path.join(data_dir, 'Segmentation')
+    mask_files = os.listdir(masks_dir)[:num_samples]
+
+    pixel_counts = Counter()
+    for fname in tqdm(mask_files, desc="Computing class weights", leave=False):
+        mask = Image.open(os.path.join(masks_dir, fname))
+        arr = np.array(mask)
+        new_arr = np.zeros_like(arr, dtype=np.uint8)
+        for raw_value, new_value in value_map.items():
+            new_arr[arr == raw_value] = new_value
+        unique, counts = np.unique(new_arr, return_counts=True)
+        for u, c in zip(unique, counts):
+            pixel_counts[int(u)] += c
+
+    total = sum(pixel_counts.values())
+    n = len(value_map)
+    weights = torch.ones(n)
+    for cls_id, count in pixel_counts.items():
+        if cls_id < n and count > 0:
+            freq = count / total
+            weights[cls_id] = 1.0 / (freq * n)
+
+    # Clamp to avoid extreme weights
+    weights = weights.clamp(min=0.5, max=10.0)
+    print(f"Class weights: {weights.tolist()}")
+    return weights
+
+
+# ============================================================================
 # Main Training Function
 # ============================================================================
 
@@ -399,26 +498,34 @@ def main():
 
     # Hyperparameters
     batch_size = 2
-    w = int(((960 / 2) // 14) * 14)
-    h = int(((540 / 2) // 14) * 14)
-    lr = 1e-4
-    n_epochs = 10
+    scale = 0.7  # Higher resolution for better detail (was 0.5)
+    w = int(((960 * scale) // 14) * 14)   # 672
+    h = int(((540 * scale) // 14) * 14)   # 378
+    lr = 1e-3
+    n_epochs = 50
+    patience = 10  # Early stopping patience
 
     # Output directory (relative to script location)
     script_dir = os.path.dirname(os.path.abspath(__file__))
     output_dir = os.path.join(script_dir, 'train_stats')
     os.makedirs(output_dir, exist_ok=True)
 
-    # Transforms
-    transform = transforms.Compose([
-        transforms.Resize((h, w)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    # Transforms (albumentations)
+    train_transform = A.Compose([
+        A.Resize(h, w),
+        A.HorizontalFlip(p=0.5),
+        A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
+        A.HueSaturationValue(p=0.3),
+        A.GaussNoise(p=0.2),
+        A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.1, rotate_limit=15, p=0.3),
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ToTensorV2(),
     ])
 
-    mask_transform = transforms.Compose([
-        transforms.Resize((h, w)),
-        transforms.ToTensor(),
+    val_transform = A.Compose([
+        A.Resize(h, w),
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ToTensorV2(),
     ])
 
     # Dataset paths (relative to script location)
@@ -426,11 +533,13 @@ def main():
     val_dir = os.path.join(script_dir, '..', 'Offroad_Segmentation_Training_Dataset', 'val')
 
     # Create datasets
-    trainset = MaskDataset(data_dir=data_dir, transform=transform, mask_transform=mask_transform)
-    train_loader = DataLoader(trainset, batch_size=batch_size, shuffle=True)
+    trainset = MaskDataset(data_dir=data_dir, transform=train_transform)
+    train_loader = DataLoader(trainset, batch_size=batch_size, shuffle=True,
+                              num_workers=4, pin_memory=True, persistent_workers=True)
 
-    valset = MaskDataset(data_dir=val_dir, transform=transform, mask_transform=mask_transform)
-    val_loader = DataLoader(valset, batch_size=batch_size, shuffle=False)
+    valset = MaskDataset(data_dir=val_dir, transform=val_transform)
+    val_loader = DataLoader(valset, batch_size=batch_size, shuffle=False,
+                            num_workers=4, pin_memory=True, persistent_workers=True)
 
     print(f"Training samples: {len(trainset)}")
     print(f"Validation samples: {len(valset)}")
@@ -448,9 +557,22 @@ def main():
     backbone_name = f"dinov2_{backbone_arch}"
 
     backbone_model = torch.hub.load(repo_or_dir="facebookresearch/dinov2", model=backbone_name)
-    backbone_model.eval()
     backbone_model.to(device)
     print("Backbone loaded successfully!")
+
+    # Freeze all backbone params, then unfreeze last N blocks
+    n_unfreeze = 4
+    for param in backbone_model.parameters():
+        param.requires_grad = False
+    for block in backbone_model.blocks[-n_unfreeze:]:
+        for param in block.parameters():
+            param.requires_grad = True
+    for param in backbone_model.norm.parameters():
+        param.requires_grad = True
+    backbone_model.train()
+
+    n_backbone_trainable = sum(p.numel() for p in backbone_model.parameters() if p.requires_grad)
+    print(f"Unfroze last {n_unfreeze} backbone blocks ({n_backbone_trainable:,} trainable params)")
 
     # Get embedding dimension from backbone
     imgs, _ = next(iter(train_loader))
@@ -470,9 +592,21 @@ def main():
     )
     classifier = classifier.to(device)
 
-    # Loss and optimizer
-    loss_fct = torch.nn.CrossEntropyLoss()
-    optimizer = optim.SGD(classifier.parameters(), lr=lr, momentum=0.9)
+    # Class weights and combined loss
+    print("Computing class weights...")
+    class_weights = compute_class_weights(data_dir)
+    loss_fct = CombinedLoss(num_classes=n_classes, class_weights=class_weights.to(device))
+
+    # Optimizer with differential learning rates
+    backbone_params = [p for p in backbone_model.parameters() if p.requires_grad]
+    optimizer = optim.AdamW([
+        {'params': backbone_params, 'lr': 1e-5},
+        {'params': classifier.parameters(), 'lr': lr},
+    ], weight_decay=0.01)
+    scheduler = CosineAnnealingLR(optimizer, T_max=n_epochs, eta_min=1e-6)
+
+    # Mixed precision
+    scaler = torch.amp.GradScaler('cuda')
 
     # Training history
     history = {
@@ -490,29 +624,31 @@ def main():
     print("\nStarting training...")
     print("=" * 80)
 
+    best_val_iou = 0.0
+    epochs_without_improvement = 0
+
     epoch_pbar = tqdm(range(n_epochs), desc="Training", unit="epoch")
     for epoch in epoch_pbar:
         # Training phase
         classifier.train()
         train_losses = []
 
-        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{n_epochs} [Train]", 
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{n_epochs} [Train]",
                           leave=False, unit="batch")
         for imgs, labels in train_pbar:
             imgs, labels = imgs.to(device), labels.to(device)
 
-            with torch.no_grad():
-                output = backbone_model.forward_features(imgs)["x_norm_patchtokens"]
-
-            logits = classifier(output.to(device))
-            outputs = F.interpolate(logits, size=imgs.shape[2:], mode="bilinear", align_corners=False)
-
-            labels = labels.squeeze(dim=1).long()
-
-            loss = loss_fct(outputs, labels)
-            loss.backward()
-            optimizer.step()
             optimizer.zero_grad()
+            with torch.amp.autocast('cuda'):
+                output = backbone_model.forward_features(imgs)["x_norm_patchtokens"]
+                logits = classifier(output)
+                outputs = F.interpolate(logits, size=imgs.shape[2:], mode="bilinear", align_corners=False)
+                labels = labels.squeeze(dim=1).long()
+                loss = loss_fct(outputs, labels)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             train_losses.append(loss.item())
             train_pbar.set_postfix(loss=f"{loss.item():.4f}")
@@ -521,28 +657,29 @@ def main():
         classifier.eval()
         val_losses = []
 
-        val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{n_epochs} [Val]", 
+        val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{n_epochs} [Val]",
                         leave=False, unit="batch")
         with torch.no_grad():
             for imgs, labels in val_pbar:
                 imgs, labels = imgs.to(device), labels.to(device)
 
                 output = backbone_model.forward_features(imgs)["x_norm_patchtokens"]
-                logits = classifier(output.to(device))
-                outputs = F.interpolate(logits, size=imgs.shape[2:], mode="bilinear", align_corners=False)
+                with torch.amp.autocast('cuda'):
+                    logits = classifier(output.to(device))
+                    outputs = F.interpolate(logits, size=imgs.shape[2:], mode="bilinear", align_corners=False)
+                    labels = labels.squeeze(dim=1).long()
+                    loss = loss_fct(outputs, labels)
 
-                labels = labels.squeeze(dim=1).long()
-                loss = loss_fct(outputs, labels)
                 val_losses.append(loss.item())
                 val_pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-        # Calculate metrics
-        train_iou, train_dice, train_pixel_acc = evaluate_metrics(
-            classifier, backbone_model, train_loader, device, num_classes=n_classes
-        )
+        # Calculate metrics (only on validation set to save time)
         val_iou, val_dice, val_pixel_acc = evaluate_metrics(
             classifier, backbone_model, val_loader, device, num_classes=n_classes
         )
+
+        # Step scheduler
+        scheduler.step()
 
         # Store history
         epoch_train_loss = np.mean(train_losses)
@@ -550,11 +687,11 @@ def main():
 
         history['train_loss'].append(epoch_train_loss)
         history['val_loss'].append(epoch_val_loss)
-        history['train_iou'].append(train_iou)
+        history['train_iou'].append(0.0)  # Skip train eval for speed
         history['val_iou'].append(val_iou)
-        history['train_dice'].append(train_dice)
+        history['train_dice'].append(0.0)
         history['val_dice'].append(val_dice)
-        history['train_pixel_acc'].append(train_pixel_acc)
+        history['train_pixel_acc'].append(0.0)
         history['val_pixel_acc'].append(val_pixel_acc)
 
         # Update epoch progress bar with metrics
@@ -562,18 +699,45 @@ def main():
             train_loss=f"{epoch_train_loss:.3f}",
             val_loss=f"{epoch_val_loss:.3f}",
             val_iou=f"{val_iou:.3f}",
-            val_acc=f"{val_pixel_acc:.3f}"
+            val_acc=f"{val_pixel_acc:.3f}",
+            lr=f"{scheduler.get_last_lr()[0]:.2e}"
         )
+
+        # Early stopping & best model saving
+        if val_iou > best_val_iou:
+            best_val_iou = val_iou
+            epochs_without_improvement = 0
+            best_model_path = os.path.join(script_dir, "segmentation_head_best.pth")
+            torch.save({
+                'classifier': classifier.state_dict(),
+                'backbone': backbone_model.state_dict(),
+            }, best_model_path)
+            print(f"\n  New best val IoU: {val_iou:.4f} — saved to '{best_model_path}'")
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= patience:
+                print(f"\n  Early stopping at epoch {epoch+1} (no improvement for {patience} epochs)")
+                break
 
     # Save plots
     print("\nSaving training curves...")
     save_training_plots(history, output_dir)
     save_history_to_file(history, output_dir)
 
-    # Save model (in scripts directory)
+    # Save final model (in scripts directory) — full checkpoint
     model_path = os.path.join(script_dir, "segmentation_head.pth")
-    torch.save(classifier.state_dict(), model_path)
-    print(f"Saved model to '{model_path}'")
+    torch.save({
+        'classifier': classifier.state_dict(),
+        'backbone': backbone_model.state_dict(),
+    }, model_path)
+    print(f"Saved final model to '{model_path}'")
+
+    # Copy best model as the primary checkpoint
+    best_model_path = os.path.join(script_dir, "segmentation_head_best.pth")
+    if os.path.exists(best_model_path):
+        import shutil
+        shutil.copy2(best_model_path, model_path)
+        print(f"Copied best model (val IoU={best_val_iou:.4f}) to '{model_path}'")
 
     # Final evaluation
     print("\nFinal evaluation results:")
