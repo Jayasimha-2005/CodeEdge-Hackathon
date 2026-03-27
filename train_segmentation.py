@@ -517,7 +517,7 @@ def main():
         A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
         A.HueSaturationValue(p=0.3),
         A.GaussNoise(p=0.2),
-        A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.1, rotate_limit=15, p=0.3),
+        A.Affine(shift_limit=0.05, scale_limit=0.1, rotate_limit=15, p=0.3),
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2(),
     ])
@@ -529,17 +529,17 @@ def main():
     ])
 
     # Dataset paths (relative to script location)
-    data_dir = os.path.join(script_dir, '..', 'Offroad_Segmentation_Training_Dataset', 'train')
-    val_dir = os.path.join(script_dir, '..', 'Offroad_Segmentation_Training_Dataset', 'val')
+    data_dir = os.path.join(script_dir, 'Offroad_Segmentation_Training_Dataset', 'train')
+    val_dir = os.path.join(script_dir, 'Offroad_Segmentation_Training_Dataset', 'val')
 
     # Create datasets
     trainset = MaskDataset(data_dir=data_dir, transform=train_transform)
     train_loader = DataLoader(trainset, batch_size=batch_size, shuffle=True,
-                              num_workers=4, pin_memory=True, persistent_workers=True)
+                              num_workers=0, pin_memory=True)
 
     valset = MaskDataset(data_dir=val_dir, transform=val_transform)
     val_loader = DataLoader(valset, batch_size=batch_size, shuffle=False,
-                            num_workers=4, pin_memory=True, persistent_workers=True)
+                            num_workers=0, pin_memory=True)
 
     print(f"Training samples: {len(trainset)}")
     print(f"Validation samples: {len(valset)}")
