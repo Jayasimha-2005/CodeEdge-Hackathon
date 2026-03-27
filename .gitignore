@@ -1,0 +1,27 @@
+# Datasets
+Offroad_Segmentation_Training_Dataset/
+Offroad_Segmentation_testImages/
+*.zip
+
+# Model weights
+*.pth
+runs/
+
+# Training outputs
+train_stats/
+predictions/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
