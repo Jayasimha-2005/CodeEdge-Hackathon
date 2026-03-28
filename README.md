@@ -21,14 +21,12 @@ Given offroad terrain images (960x540), predict a pixel-wise segmentation mask a
 
 | Class | Color | Class | Color |
 |-------|-------|-------|-------|
-| Background | ![#000000](https://via.placeholder.com/12/000000/000000) Black | Ground Clutter | ![#808000](https://via.placeholder.com/12/808000/808000) Olive |
-| Trees | ![#228B22](https://via.placeholder.com/12/228B22/228B22) Forest Green | Flowers | ![#FF69B4](https://via.placeholder.com/12/FF69B4/FF69B4) Hot Pink |
-| Lush Bushes | ![#00FF00](https://via.placeholder.com/12/00FF00/00FF00) Lime | Logs | ![#8B4513](https://via.placeholder.com/12/8B4513/8B4513) Saddle Brown |
-| Dry Grass | ![#D2B48C](https://via.placeholder.com/12/D2B48C/D2B48C) Tan | Rocks | ![#808080](https://via.placeholder.com/12/808080/808080) Gray |
-| Dry Bushes | ![#8B5A2B](https://via.placeholder.com/12/8B5A2B/8B5A2B) Brown | Landscape | ![#A0522D](https://via.placeholder.com/12/A0522D/A0522D) Sienna |
-| | | Sky | ![#87CEEB](https://via.placeholder.com/12/87CEEB/87CEEB) Sky Blue |
-
----
+| Background | ![#000000](https://img.shields.io/badge/-000000-000000?style=flat-square) Black | Ground Clutter | ![#FFD700](https://img.shields.io/badge/-FFD700-FFD700?style=flat-square) Gold |
+| Trees | ![#006400](https://img.shields.io/badge/-006400-006400?style=flat-square) Dark Green | Flowers | ![#FF69B4](https://img.shields.io/badge/-FF69B4-FF69B4?style=flat-square) Hot Pink |
+| Lush Bushes | ![#00FF00](https://img.shields.io/badge/-00FF00-00FF00?style=flat-square) Lime | Logs | ![#8B4513](https://img.shields.io/badge/-8B4513-8B4513?style=flat-square) Saddle Brown |
+| Dry Grass | ![#F4A460](https://img.shields.io/badge/-F4A460-F4A460?style=flat-square) Sandy Brown | Rocks | ![#808080](https://img.shields.io/badge/-808080-808080?style=flat-square) Gray |
+| Dry Bushes | ![#A0522D](https://img.shields.io/badge/-A0522D-A0522D?style=flat-square) Sienna | Landscape | ![#CD853F](https://img.shields.io/badge/-CD853F-CD853F?style=flat-square) Peru |
+| | | Sky | ![#87CEEB](https://img.shields.io/badge/-87CEEB-87CEEB?style=flat-square) Sky Blue |
 
 ## Dataset Overview
 
