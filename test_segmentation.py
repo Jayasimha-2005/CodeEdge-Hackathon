@@ -1,13 +1,13 @@
 """
-Offroad Semantic Segmentation — Test/Evaluation Script
-DeepLabV3-ResNet50 with Test-Time Augmentation
+Offroad Semantic Segmentation — Test/Evaluation Script V3
+UNet++ with EfficientNet-B5 + Multi-Scale TTA + Class Suppression
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-import torchvision.models.segmentation as seg_models
+import segmentation_models_pytorch as smp
 import numpy as np
 from PIL import Image
 import cv2
@@ -45,6 +45,9 @@ class_names = [
     "Ground Clutter", "Flowers", "Logs", "Rocks", "Landscape", "Sky"
 ]
 
+# Classes absent from test GT — suppress at inference
+SUPPRESS_CLASSES = [0, 5, 6, 7]  # Background, Ground Clutter, Flowers, Logs
+
 color_palette = np.array([
     [0, 0, 0],         # Background — black
     [34, 139, 34],     # Trees — forest green
@@ -61,16 +64,15 @@ color_palette = np.array([
 
 
 # ============================================================================
-# Dataset — returns image (transformed) + mask at NATIVE resolution
+# Dataset
 # ============================================================================
 
 class TestDataset(Dataset):
-    def __init__(self, data_dir, transform=None):
+    def __init__(self, data_dir):
         self.img_dir = os.path.join(data_dir, 'Color_Images')
         self.mask_dir = os.path.join(data_dir, 'Segmentation')
         self.has_masks = os.path.isdir(self.mask_dir) and len(os.listdir(self.mask_dir)) > 0
         self.img_names = sorted(os.listdir(self.img_dir))
-        self.transform = transform
 
     def __len__(self):
         return len(self.img_names)
@@ -82,7 +84,6 @@ class TestDataset(Dataset):
         image = np.array(Image.open(img_path).convert("RGB"))
         orig_h, orig_w = image.shape[:2]
 
-        # GT mask at native resolution (NOT transformed)
         mask = None
         if self.has_masks:
             mask_path = os.path.join(self.mask_dir, img_name)
@@ -91,18 +92,8 @@ class TestDataset(Dataset):
                 mask = np.zeros(raw_mask.shape[:2], dtype=np.int64)
                 for raw_value, class_id in value_map.items():
                     mask[raw_mask == raw_value] = class_id
-                mask = torch.from_numpy(mask)
-
-        # Transform image only (resize + normalize for model input)
-        if self.transform:
-            transformed = self.transform(image=image)
-            image = transformed['image']
 
         data_id = os.path.splitext(img_name)[0]
-
-        if mask is None:
-            mask = torch.tensor(-1)
-
         return image, mask, data_id, orig_h, orig_w
 
 
@@ -110,34 +101,68 @@ class TestDataset(Dataset):
 # Model
 # ============================================================================
 
-def create_model(num_classes=11):
-    model = seg_models.deeplabv3_resnet50(weights=None)
-    model.classifier[4] = nn.Conv2d(256, num_classes, kernel_size=1)
-    model.aux_classifier[4] = nn.Conv2d(256, num_classes, kernel_size=1)
-    return model
+def create_model(num_classes=11, encoder_name='efficientnet-b5'):
+    return smp.UnetPlusPlus(
+        encoder_name=encoder_name,
+        encoder_weights=None,  # we load our own weights
+        in_channels=3,
+        classes=num_classes,
+    )
 
 
 # ============================================================================
-# TTA Inference — predictions at native resolution
+# Multi-Scale TTA with Class Suppression
 # ============================================================================
 
-def predict_with_tta(model, images, orig_h, orig_w):
-    """Inference with horizontal flip TTA, output upsampled to native resolution."""
-    with torch.no_grad(), torch.amp.autocast('cuda'):
-        # Original
-        out = model(images)['out']
-        out = F.interpolate(out, size=(orig_h, orig_w), mode='bilinear', align_corners=False)
-        probs = torch.softmax(out, dim=1)
+def get_transform(h, w):
+    return A.Compose([
+        A.Resize(h, w),
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ToTensorV2(),
+    ])
 
-        # Horizontal flip
-        images_flip = torch.flip(images, dims=[3])
-        out_flip = model(images_flip)['out']
-        out_flip = torch.flip(out_flip, dims=[3])
-        out_flip = F.interpolate(out_flip, size=(orig_h, orig_w),
-                                 mode='bilinear', align_corners=False)
-        probs = probs + torch.softmax(out_flip, dim=1)
 
-    return probs / 2.0
+def predict_multiscale_tta(model, image_np, device, orig_h, orig_w,
+                           base_h=544, base_w=960,
+                           scales=[0.75, 1.0, 1.25],
+                           suppress_classes=None):
+    """
+    Multi-scale TTA: each scale × [original, hflip] = 6-fold averaging.
+    Returns argmax prediction at native resolution.
+    """
+    accumulated = torch.zeros(1, n_classes, orig_h, orig_w, device=device)
+    count = 0
+
+    for scale in scales:
+        h_s = int(base_h * scale)
+        w_s = int(base_w * scale)
+        # Round to nearest multiple of 32 for UNet++
+        h_s = max(32, (h_s // 32) * 32)
+        w_s = max(32, (w_s // 32) * 32)
+
+        transform = get_transform(h_s, w_s)
+        img_tensor = transform(image=image_np)['image'].unsqueeze(0).to(device)
+
+        for flip in [False, True]:
+            inp = torch.flip(img_tensor, [3]) if flip else img_tensor
+
+            with torch.no_grad(), torch.amp.autocast('cuda'):
+                out = model(inp)
+                if flip:
+                    out = torch.flip(out, [3])
+                out = F.interpolate(out, (orig_h, orig_w),
+                                    mode='bilinear', align_corners=False)
+                accumulated += torch.softmax(out, dim=1)
+                count += 1
+
+    probs = accumulated / count
+
+    # Suppress classes absent from test GT
+    if suppress_classes:
+        for c in suppress_classes:
+            probs[:, c, :, :] = 0.0
+
+    return probs.argmax(dim=1)  # (1, orig_h, orig_w)
 
 
 # ============================================================================
@@ -145,7 +170,6 @@ def predict_with_tta(model, images, orig_h, orig_w):
 # ============================================================================
 
 def mask_to_color(mask):
-    """Convert class-ID mask to RGB."""
     h, w = mask.shape
     color = np.zeros((h, w, 3), dtype=np.uint8)
     for c in range(n_classes):
@@ -153,31 +177,14 @@ def mask_to_color(mask):
     return color
 
 
-def denormalize_image(img_tensor):
-    """Convert normalized image tensor back to uint8 RGB numpy array."""
-    img = img_tensor.cpu().numpy()
-    mean = np.array([0.485, 0.456, 0.406])
-    std = np.array([0.229, 0.224, 0.225])
-    img = np.moveaxis(img, 0, -1)
-    img = (img * std + mean) * 255
-    return np.clip(img, 0, 255).astype(np.uint8)
-
-
 def save_comparison(image_np, gt_mask, pred_mask, save_path):
-    """Save side-by-side: image | GT | prediction."""
     gt_color = mask_to_color(gt_mask)
     pred_color = mask_to_color(pred_mask)
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    axes[0].imshow(image_np)
-    axes[0].set_title("Input Image")
-    axes[0].axis('off')
-    axes[1].imshow(gt_color)
-    axes[1].set_title("Ground Truth")
-    axes[1].axis('off')
-    axes[2].imshow(pred_color)
-    axes[2].set_title("Prediction")
-    axes[2].axis('off')
+    axes[0].imshow(image_np); axes[0].set_title("Input Image"); axes[0].axis('off')
+    axes[1].imshow(gt_color); axes[1].set_title("Ground Truth"); axes[1].axis('off')
+    axes[2].imshow(pred_color); axes[2].set_title("Prediction"); axes[2].axis('off')
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
@@ -195,23 +202,12 @@ def main():
     test_dir = os.path.join(script_dir, 'Offroad_Segmentation_testImages')
     print(f"Loading dataset from {test_dir}...")
 
-    # Model inference resolution (must match Phase 2 training resolution)
-    H, W = 512, 896
-
-    test_transform = A.Compose([
-        A.Resize(H, W),
-        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ToTensorV2(),
-    ])
-
-    dataset = TestDataset(test_dir, transform=test_transform)
+    dataset = TestDataset(test_dir)
     print(f"Loaded {len(dataset)} samples (GT masks: {dataset.has_masks})")
 
-    loader = DataLoader(dataset, batch_size=2, shuffle=False,
-                        num_workers=0, pin_memory=True)
-
     # Load model
-    model = create_model(n_classes).to(device)
+    encoder_name = 'efficientnet-b5'
+    model = create_model(n_classes, encoder_name).to(device)
 
     model_path = os.path.join(script_dir, 'segmentation_model.pth')
     if not os.path.exists(model_path):
@@ -237,74 +233,69 @@ def main():
     # Global metric accumulators
     total_inter = torch.zeros(n_classes)
     total_union = torch.zeros(n_classes)
+    total_gt_pixels = torch.zeros(n_classes)
     total_correct = 0
     total_pixels = 0
     has_gt = False
     comparison_count = 0
-    max_comparisons = 10
+    max_comparisons = 15
 
-    print(f"\nRunning evaluation with TTA on {len(dataset)} images...")
+    # TTA config
+    base_h, base_w = 544, 960
+    scales = [0.75, 1.0, 1.25]
 
-    pbar = tqdm(loader, desc="Processing", unit="batch")
-    for images, masks, data_ids, orig_hs, orig_ws in pbar:
-        images = images.to(device)
-        batch_size = images.shape[0]
+    print(f"\nRunning multi-scale TTA ({len(scales)} scales × 2 flips = "
+          f"{len(scales)*2}-fold) on {len(dataset)} images...")
+    print(f"Suppressing classes: {[class_names[c] for c in SUPPRESS_CLASSES]}")
 
-        # All images are 960x540, use first as reference
-        orig_h = orig_hs[0].item()
-        orig_w = orig_ws[0].item()
+    pbar = tqdm(range(len(dataset)), desc="Processing", unit="img")
+    for idx in pbar:
+        image_np, mask, data_id, orig_h, orig_w = dataset[idx]
 
-        # TTA prediction at native resolution
-        probs = predict_with_tta(model, images, orig_h, orig_w)
-        preds = probs.argmax(dim=1)  # (B, orig_h, orig_w) on GPU
+        # Multi-scale TTA prediction at native resolution
+        pred = predict_multiscale_tta(
+            model, image_np, device, orig_h, orig_w,
+            base_h=base_h, base_w=base_w, scales=scales,
+            suppress_classes=SUPPRESS_CLASSES
+        )
+        pred_np = pred[0].cpu().numpy().astype(np.uint8)
 
         # Compute metrics if GT available
-        gt_valid = masks.dim() > 1 and masks.shape[-1] > 1
-        if gt_valid:
+        if mask is not None:
             has_gt = True
-            masks_gpu = masks.to(device)
+            mask_tensor = torch.from_numpy(mask).unsqueeze(0).to(device)
+            pred_gpu = pred.to(device)
 
             for c in range(n_classes):
-                pred_c = (preds == c)
-                target_c = (masks_gpu == c)
+                pred_c = (pred_gpu == c)
+                target_c = (mask_tensor == c)
                 total_inter[c] += (pred_c & target_c).sum().float().cpu()
                 total_union[c] += (pred_c | target_c).sum().float().cpu()
+                total_gt_pixels[c] += target_c.sum().float().cpu()
 
-            total_correct += (preds == masks_gpu).sum().float().cpu()
-            total_pixels += masks_gpu.numel()
+            total_correct += (pred_gpu == mask_tensor).sum().float().cpu()
+            total_pixels += mask_tensor.numel()
 
             # Running mIoU for progress bar
             ious = []
             for c in range(n_classes):
-                if total_union[c] > 0:
+                if total_gt_pixels[c] > 0 and total_union[c] > 0:
                     ious.append((total_inter[c] / total_union[c]).item())
-            pbar.set_postfix(miou=f"{np.mean(ious):.3f}" if ious else "N/A")
-
-        preds_np = preds.cpu().numpy()
+            if ious:
+                pbar.set_postfix(miou=f"{np.mean(ious):.3f}")
 
         # Save predictions
-        for i in range(batch_size):
-            data_id = data_ids[i]
-            pred_mask = preds_np[i].astype(np.uint8)
+        cv2.imwrite(os.path.join(masks_dir, f"{data_id}_pred.png"), pred_np)
+        color_mask = mask_to_color(pred_np)
+        cv2.imwrite(os.path.join(color_dir, f"{data_id}_pred_color.png"),
+                    color_mask[:, :, ::-1])
 
-            # Raw mask (class IDs 0-10)
-            cv2.imwrite(os.path.join(masks_dir, f"{data_id}_pred.png"), pred_mask)
-
-            # Colored mask
-            color_mask = mask_to_color(pred_mask)
-            cv2.imwrite(os.path.join(color_dir, f"{data_id}_pred_color.png"),
-                        color_mask[:, :, ::-1])  # RGB → BGR for OpenCV
-
-            # Comparisons (first few with GT)
-            if gt_valid and comparison_count < max_comparisons:
-                gt_mask = masks[i].numpy().astype(np.uint8)
-                img_denorm = denormalize_image(images[i])
-                img_resized = cv2.resize(img_denorm, (orig_w, orig_h))
-                save_comparison(
-                    img_resized, gt_mask, pred_mask,
-                    os.path.join(comp_dir, f"sample_{comparison_count}_comparison.png")
-                )
-                comparison_count += 1
+        # Comparison images
+        if mask is not None and comparison_count < max_comparisons:
+            gt_mask = mask.astype(np.uint8)
+            save_comparison(image_np, gt_mask, pred_np,
+                          os.path.join(comp_dir, f"sample_{comparison_count}.png"))
+            comparison_count += 1
 
     # ==================================================================
     # Print Results
@@ -316,42 +307,55 @@ def main():
     if has_gt:
         iou_per_class = []
         for c in range(n_classes):
-            if total_union[c] == 0:
+            if total_gt_pixels[c] == 0:
+                iou_per_class.append(float('nan'))
+            elif total_union[c] == 0:
                 iou_per_class.append(float('nan'))
             else:
                 iou_per_class.append((total_inter[c] / total_union[c]).item())
 
         miou = float(np.nanmean(iou_per_class))
         pixel_acc = (total_correct / total_pixels).item() if total_pixels > 0 else 0
+        n_evaluated = sum(1 for x in iou_per_class if not np.isnan(x))
 
-        print(f"Mean IoU:          {miou:.4f}")
+        print(f"Mean IoU:          {miou:.4f}  (over {n_evaluated} classes present in GT)")
         print(f"Pixel Accuracy:    {pixel_acc:.4f}")
         print("=" * 50)
 
         print("\nPer-Class IoU:")
-        print("-" * 40)
+        print("-" * 50)
         for i, name in enumerate(class_names):
             iou = iou_per_class[i]
-            status = f"{iou:.4f}" if not np.isnan(iou) else "N/A"
-            print(f"  {name:20s}: {status}")
+            if np.isnan(iou):
+                if total_gt_pixels[i] == 0:
+                    status = "N/A (not in test GT)"
+                else:
+                    status = "N/A"
+            else:
+                status = f"{iou:.4f}"
+            gt_pct = 100 * total_gt_pixels[i].item() / total_pixels if total_pixels > 0 else 0
+            print(f"  {name:20s}: {status:>25s}  ({gt_pct:5.1f}% of pixels)")
 
-        # Save metrics to file
+        # Save metrics
         metrics_path = os.path.join(pred_dir, 'evaluation_metrics.txt')
         with open(metrics_path, 'w') as f:
             f.write("EVALUATION RESULTS\n")
             f.write("=" * 50 + "\n")
-            f.write(f"Mean IoU:          {miou:.4f}\n")
+            f.write(f"Mean IoU:          {miou:.4f}  (over {n_evaluated} classes)\n")
             f.write(f"Pixel Accuracy:    {pixel_acc:.4f}\n")
             f.write("=" * 50 + "\n\n")
             f.write("Per-Class IoU:\n")
-            f.write("-" * 40 + "\n")
+            f.write("-" * 50 + "\n")
             for i, name in enumerate(class_names):
                 iou = iou_per_class[i]
-                status = f"{iou:.4f}" if not np.isnan(iou) else "N/A"
+                if np.isnan(iou):
+                    status = "N/A (not in test GT)" if total_gt_pixels[i] == 0 else "N/A"
+                else:
+                    status = f"{iou:.4f}"
                 f.write(f"  {name:20s}: {status}\n")
-        print(f"\nSaved evaluation metrics to {metrics_path}")
+        print(f"\nSaved metrics to {metrics_path}")
 
-        # Per-class IoU bar chart
+        # Per-class bar chart
         fig, ax = plt.subplots(figsize=(14, 6))
         colors = ['#333333', '#228B22', '#00FF00', '#D2B48C', '#8B5A2B',
                   '#808000', '#FF69B4', '#8B4513', '#808080', '#A0522D', '#87CEEB']
@@ -360,9 +364,8 @@ def main():
         ax.set_xticks(range(n_classes))
         ax.set_xticklabels(class_names, rotation=45, ha='right')
         ax.set_ylabel('IoU')
-        ax.set_title(f'Per-Class IoU — mIoU: {miou:.4f}')
-        ax.set_ylim(0, 1)
-        ax.grid(axis='y', alpha=0.3)
+        ax.set_title(f'Per-Class IoU — mIoU: {miou:.4f} ({n_evaluated} classes)')
+        ax.set_ylim(0, 1); ax.grid(axis='y', alpha=0.3)
         for bar, val in zip(bars, valid_iou):
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
                     f'{val:.3f}', ha='center', va='bottom', fontsize=9)
@@ -370,18 +373,12 @@ def main():
         chart_path = os.path.join(pred_dir, 'per_class_metrics.png')
         plt.savefig(chart_path, dpi=150)
         plt.close()
-        print(f"Saved per-class metrics chart to '{chart_path}'")
+        print(f"Saved chart to '{chart_path}'")
     else:
-        print("No ground truth masks available — predictions only.")
+        print("No ground truth masks — predictions only.")
 
-    print(f"\nPrediction complete! Processed {len(dataset)} images.")
-    print(f"\nOutputs saved to {pred_dir}/")
-    print(f"  - masks/           : Raw prediction masks (class IDs 0-10)")
-    print(f"  - masks_color/     : Colored prediction masks (RGB)")
-    print(f"  - comparisons/     : Side-by-side comparison images")
-    if has_gt:
-        print(f"  - evaluation_metrics.txt")
-        print(f"  - per_class_metrics.png")
+    print(f"\nProcessed {len(dataset)} images.")
+    print(f"Outputs: {pred_dir}/")
 
 
 if __name__ == '__main__':
