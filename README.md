@@ -135,7 +135,7 @@ Scales [0.75, 1.0, 1.25]  x  [Original, H-Flip]  =  6 predictions averaged
 | Metric | Score |
 |--------|------:|
 | Val mIoU | **0.6497** |
-| Test mIoU (7 classes) | **0.3957** |
+| Test mIoU (7 classes) | **0.4957** |
 | Test Pixel Accuracy | 0.6811 |
 
 **Per-Class Breakdown (Test Set)**:
@@ -286,7 +286,7 @@ If we had more time, here's what would move the needle most:
 
 | Tool | Role |
 |------|------|
-| **PyTorch 2.x + CUDA** | Deep learning framework (RTX 5060 Laptop, 8GB VRAM) |
+| **PyTorch 2.x + CUDA** | Deep learning framework |
 | **segmentation_models_pytorch** | UNet++ architecture with pretrained encoders |
 | **timm** | EfficientNet-B5 encoder backbone |
 | **albumentations** | Fast augmentation pipeline with mask support |
